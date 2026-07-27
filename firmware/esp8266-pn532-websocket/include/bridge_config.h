@@ -24,10 +24,19 @@ constexpr uint32_t BUTTON_RESULT_TIMEOUT_MS = 3000;
 constexpr uint32_t BUTTON_DEBOUNCE_MS = 40;
 constexpr uint32_t FIRMWARE_INITIAL_CHECK_DELAY_MS = 60000;
 constexpr uint32_t FIRMWARE_CHECK_INTERVAL_MS = 6UL * 60UL * 60UL * 1000UL;
+constexpr uint32_t PN532_RESET_ASSERT_MS = 20;
+constexpr uint32_t PN532_RESET_BOOT_MS = 100;
+constexpr uint32_t DISCOVERY_INTERVAL_MS = 40;
+constexpr uint32_t DISCOVERY_TARGET_WATCHDOG_MS = 15000;
+constexpr uint32_t DISCOVERY_REMOVAL_CONFIRM_MS = 750;
+constexpr uint32_t DISCOVERY_RETRY_DELAY_MS = 500;
+constexpr uint8_t DISCOVERY_FAILURE_LIMIT = 3;
 
-// D1/D2 are safe general-purpose pins now that PN532 uses hardware UART.
+// D1/D2/D5 are safe general-purpose pins now that PN532 uses hardware UART.
 // Avoid the old D3/D4 wiring: GPIO0/GPIO2 determine ESP8266 boot mode.
 constexpr uint8_t STATUS_LED_PIN = D1;  // GPIO5, external LED, active high.
 constexpr uint8_t BUTTON_PIN = D2;      // GPIO4, button to GND, pull-up.
+// Connect only to the PN532 RSTPD_N input (active low), never RSTOUT_N.
+constexpr uint8_t PN532_RESET_PIN = D5; // GPIO14.
 
-constexpr char FIRMWARE_VERSION[] = "2.4.0";
+constexpr char FIRMWARE_VERSION[] = "3.2.0";

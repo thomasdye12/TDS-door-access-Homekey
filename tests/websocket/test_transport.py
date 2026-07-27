@@ -25,6 +25,8 @@ class FakeConnection:
         self.requests.append((message_type, payload, timeout_ms))
         if message_type == MessageType.EXECUTE:
             return ACK + self.response
+        if message_type == MessageType.TRANSCEIVE:
+            return bytes.fromhex("009000")
         return b""
 
 
@@ -60,6 +62,29 @@ class TransportTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(IOError, "without a pending command"):
             transport.read(100)
+
+    def test_iso_dep_transceive_is_one_reader_request(self) -> None:
+        manager = FakeManager()
+        transport = WebSocketPn532Transport(
+            manager, "c8c9a33859af"
+        )
+
+        status, response = transport.transceive(
+            bytes.fromhex("E080"), 0.03
+        )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(response, bytearray.fromhex("9000"))
+        self.assertEqual(
+            manager.connection.requests,
+            [
+                (
+                    MessageType.TRANSCEIVE,
+                    bytes.fromhex("E080"),
+                    30,
+                )
+            ],
+        )
 
     def test_extended_diagnostic_response_is_cached_intact(self) -> None:
         diagnostic_response = (

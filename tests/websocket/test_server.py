@@ -187,6 +187,43 @@ class ServerTests(unittest.TestCase):
         finally:
             server.stop()
 
+    def test_target_event_is_delivered_to_reader_worker(self) -> None:
+        record = ReaderRecord(READER_ID, "front-door", TOKEN, True)
+        manager = ReaderManager({READER_ID: record})
+        port = unused_port()
+        server = ReaderWebSocketServer(manager, "127.0.0.1", port)
+        server.start()
+        target = bytes.fromhex("0101014400200404A1B2C3")
+        try:
+            with connect(
+                f"ws://127.0.0.1:{port}/readers"
+            ) as websocket:
+                websocket.send(
+                    json.dumps(
+                        {
+                            "type": "hello",
+                            "protocol": 1,
+                            "reader_id": READER_ID,
+                            "token": TOKEN,
+                            "firmware": "3.0.0",
+                        }
+                    )
+                )
+                connection = manager.wait_for(READER_ID, timeout=2)
+                websocket.send(
+                    Message(
+                        MessageType.TARGET_EVENT,
+                        request_id=0x90000000,
+                        payload=target,
+                    ).encode()
+                )
+                self.assertEqual(
+                    connection.wait_for_target(timeout=2),
+                    target,
+                )
+        finally:
+            server.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

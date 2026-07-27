@@ -73,8 +73,15 @@ The ESP8266 UART is 3.3 V logic. Do not apply 5 V UART signals.
 |---|---|---|
 | External LED | `D1` / GPIO5 | `D1 -> resistor -> LED -> GND` |
 | Button | `D2` / GPIO4 | Momentary button between `D2` and `GND` |
+| PN532 reset | `D5` / GPIO14 | `D5 -> RSTPD_N` |
 
-D1/D2 avoid the ESP8266 boot-mode pins used by the original prototype.
+D1/D2/D5 avoid the ESP8266 boot-mode pins used by the original prototype.
+Connect D5 only to the PN532's active-low `RSTPD_N` input. Do not connect it
+to `RSTOUT_N`, which is an output. Firmware resets the PN532 at startup and
+before each transport reinitialization, allowing recovery from a stuck reader
+without cycling power. If the carrier does not expose `RSTPD_N`, leave D5
+unconnected; switching PN532 power requires a proper transistor or load
+switch, not direct GPIO power.
 
 ## Repository layout
 
@@ -204,8 +211,51 @@ Any HTTP 2xx response is accepted. JSON may explicitly provide `success` or
 
 ## Controller-managed firmware updates
 
-Firmware 2.4 checks the authenticated controller endpoint at startup, every
-six hours and whenever the controller requests an immediate check.
+Firmware 2.4 and later check the authenticated controller endpoint at startup,
+every six hours and whenever the controller requests an immediate check.
+
+For normal deployments, build, publish, restart, roll out, and verify every
+configured reader with one command:
+
+```bash
+./deploy-firmware
+```
+
+To update only selected readers:
+
+```bash
+./deploy-firmware --target c8c9a33859af
+```
+
+The command reads the version from `bridge_config.h` and the firmware admin
+token from `controller.json`; neither needs to be copied into the command.
+
+Firmware 2.6 performs Type-A polling and the complete Home Key ECP discovery
+sequence locally on the ESP8266. This removes the individual WebSocket round
+trips from discovery while keeping Home Key authentication and key storage on
+the controller.
+
+Firmware 3.0 makes discovery fully autonomous. The controller configures the
+ECP frame once after connection; the ESP8266 then performs idle polling, ECP
+broadcasting, RF timing and card-removal detection without controller
+requests. It sends one target event when a phone or RFID credential is found.
+The controller performs authentication and sends one resume command when the
+transaction is complete.
+
+Firmware 3.1 also performs the PN532 register setup, RF timeout configuration
+and ISO-DEP transceive as one local operation. Each Home Key radio frame now
+uses one WebSocket request instead of four. Successful credentials require a
+confirmed removal before rediscovery; failed sessions use a controlled local
+retry delay.
+
+Firmware 3.1.1 clears stale target events during radio reinitialization,
+terminates unrecoverable PN532 `0x0B` protocol sessions without five futile
+retransmissions, and explicitly switches the RF field off before retrying.
+
+Firmware 3.2 runs each ISO-DEP transceive as a cooperative ESP8266 state
+machine. PN532 acknowledgement and response waits no longer block the
+WebSocket callback, so heartbeats, button handling and OTA remain responsive
+while an iPhone uses long frame-waiting-time extensions.
 
 Build and publish a fixed approved image:
 
@@ -215,7 +265,7 @@ pio run -d firmware/esp8266-pn532-websocket -e websocket
 PYTHONPATH=backend backend/.venv/bin/python \
   backend/manage_controller.py publish-firmware \
   --binary firmware/esp8266-pn532-websocket/.pio/build/websocket/firmware.bin \
-  --version 2.4.0
+  --version 3.2.0
 ```
 
 Publishing calculates MD5/SHA-256, copies the image into the ignored runtime
@@ -258,8 +308,9 @@ Useful endpoints:
 | `POST` | `/api/firmware/rollout` | Admin bearer token |
 | `GET` | `/firmware/latest` | Reader Basic authentication |
 
-Firmware 2.3 must receive firmware 2.4 once through USB or Arduino OTA. After
-2.4 is installed, future releases can be managed entirely by the controller.
+Firmware 2.3 must receive firmware 2.4 or later once through USB or Arduino
+OTA. After that migration, future releases can be managed entirely by the
+controller.
 
 ## Backups
 

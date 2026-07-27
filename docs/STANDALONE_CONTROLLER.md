@@ -162,6 +162,11 @@ controller serves one locally published, checksummed image on port 8766.
 Rollouts may target all readers or selected MACs, and connected readers can be
 asked to check immediately. See `docs/OPERATIONS.md`.
 
+Firmware 2.5 adds automatic PN532 hardware recovery. Connect NodeMCU `D5`
+(GPIO14) to the PN532 `RSTPD_N` input. The reader pulses this active-low input
+at startup and whenever the backend reinitializes the transport. Never connect
+D5 to `RSTOUT_N`, which is an output.
+
 ## Doorbell button and external LED
 
 Firmware 2.3 adds a debounced doorbell button and external status LED:

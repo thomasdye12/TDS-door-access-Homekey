@@ -37,7 +37,7 @@ Expected:
   "door_id": "shared-door-controller",
   "connected_readers": 1,
   "configured_readers": 1,
-  "firmware_version": "2.4.0",
+  "firmware_version": "2.5.0",
   "firmware_status": "ready"
 }
 ```
@@ -128,6 +128,8 @@ matching key file cannot be decrypted.
 - Controller restart: readers reconnect automatically.
 - PN532 transient RF failure: presentation fails and polling resumes.
 - Repeated PN532 transport failure: worker closes and reinitializes PN532.
+- PN532 initialization failure with reset wired: D5 pulses the active-low
+  `RSTPD_N` input before reinitialization.
 - Interrupted OTA: ESP8266 retains the previous bootable image.
 - Invalid firmware manifest: health reports `firmware_status: invalid` and no
   image is served.

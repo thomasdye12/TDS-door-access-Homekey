@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+
+PROJECT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+export PYTHONPATH="$PROJECT_ROOT/backend"
+exec "$PROJECT_ROOT/backend/.venv/bin/python" \
+  "$PROJECT_ROOT/backend/deploy_firmware.py" "$@"

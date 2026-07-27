@@ -70,3 +70,17 @@ class WebSocketPn532Transport:
             response = self._cached_response
             self._cached_response = None
             return bytearray(response)
+
+    def transceive(
+        self, data: bytes | bytearray, timeout: float
+    ) -> tuple[int, bytearray]:
+        timeout_ms = min(max(int(timeout * 1000), 1), 0xFFFF)
+        connection = self.manager.wait_for(self.reader_id, timeout=5)
+        response = connection.request(
+            MessageType.TRANSCEIVE,
+            payload=bytes(data),
+            timeout_ms=timeout_ms,
+        )
+        if not response:
+            raise IOError("reader returned an empty RF response")
+        return response[0], bytearray(response[1:])

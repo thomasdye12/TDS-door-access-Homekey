@@ -29,6 +29,43 @@ class ProtocolTests(unittest.TestCase):
         )
         self.assertEqual(Message.decode(message.encode()), message)
 
+    def test_discover_round_trip(self) -> None:
+        message = Message(
+            type=MessageType.DISCOVER,
+            request_id=45,
+            timeout_ms=1500,
+            payload=bytes.fromhex("6a020000000000000000"),
+        )
+        self.assertEqual(Message.decode(message.encode()), message)
+
+    def test_autonomous_discovery_messages_round_trip(self) -> None:
+        start = Message(
+            type=MessageType.START_DISCOVERY,
+            request_id=46,
+            timeout_ms=500,
+            payload=bytes.fromhex("6a020000000000000000"),
+        )
+        target = Message(
+            type=MessageType.TARGET_EVENT,
+            request_id=0x90000000,
+            payload=bytes.fromhex("0101014400200404A1B2C3"),
+        )
+        resume = Message(
+            type=MessageType.RESUME_DISCOVERY,
+            request_id=47,
+        )
+        for message in (start, target, resume):
+            self.assertEqual(Message.decode(message.encode()), message)
+
+    def test_transceive_round_trip(self) -> None:
+        message = Message(
+            type=MessageType.TRANSCEIVE,
+            request_id=48,
+            timeout_ms=30,
+            payload=bytes.fromhex("E080"),
+        )
+        self.assertEqual(Message.decode(message.encode()), message)
+
     def test_button_event_and_result_round_trip(self) -> None:
         event = Message(
             type=MessageType.BUTTON_EVENT,

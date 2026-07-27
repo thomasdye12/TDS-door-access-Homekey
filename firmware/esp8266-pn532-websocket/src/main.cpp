@@ -34,6 +34,12 @@ bool buttonRawPressed = false;
 bool buttonStablePressed = false;
 bool firmwareCheckRequested = false;
 bool firmwareFirstCheckCompleted = false;
+bool autonomousDiscoveryEnabled = false;
+bool discoveryTargetPending = false;
+bool discoveryWaitForRemoval = false;
+uint8_t discoveryFrame[64];
+uint8_t discoveryFrameLength = 0;
+uint8_t consecutiveDiscoveryFailures = 0;
 uint32_t lastWifiAttemptAt = 0;
 uint32_t accessFeedbackUntil = 0;
 uint32_t buttonChangedAt = 0;
@@ -41,10 +47,45 @@ uint32_t buttonRequestId = 0;
 uint32_t buttonSentAt = 0;
 uint32_t nextButtonRequestId = 0x80000000;
 uint32_t lastFirmwareCheckAt = 0;
+uint32_t nextDiscoveryAt = 0;
+uint32_t discoveryTargetPendingAt = 0;
+uint32_t discoveryNoTargetSince = 0;
+uint32_t nextTargetEventRequestId = 0x90000000;
 bool lastAccessGranted = false;
 String readerId;
 String readerToken;
 String deviceHostname;
+
+enum class AsyncFramePhase : uint8_t {
+  IDLE,
+  WAIT_ACK,
+  WAIT_RESPONSE,
+};
+
+enum class TransceiveStep : uint8_t {
+  IDLE,
+  READ_REGISTERS,
+  WRITE_REGISTERS,
+  CONFIGURE_TIMEOUT,
+  EXCHANGE,
+};
+
+struct AsyncPn532Command {
+  bool active = false;
+  AsyncFramePhase phase = AsyncFramePhase::IDLE;
+  uint8_t command = 0;
+  uint8_t syncState = 0;
+  size_t frameLength = 0;
+  uint16_t responseTimeoutMs = 0;
+  uint32_t deadline = 0;
+};
+
+AsyncPn532Command asyncPn532;
+TransceiveStep transceiveStep = TransceiveStep::IDLE;
+uint8_t transceivePayload[250];
+uint8_t transceivePayloadLength = 0;
+uint16_t transceiveTimeoutMs = 0;
+uint32_t transceiveRequestId = 0;
 
 static void setStatusLed(bool on);
 
@@ -94,6 +135,26 @@ static void clearPn532Input() {
   while (Serial.available()) {
     Serial.read();
   }
+}
+
+static void cancelAsyncTransceive() {
+  asyncPn532.active = false;
+  asyncPn532.phase = AsyncFramePhase::IDLE;
+  asyncPn532.frameLength = 0;
+  asyncPn532.syncState = 0;
+  transceiveStep = TransceiveStep::IDLE;
+  transceivePayloadLength = 0;
+  waitingForPn532Response = false;
+}
+
+static void hardwareResetPn532() {
+  cancelAsyncTransceive();
+  clearPn532Input();
+  digitalWrite(PN532_RESET_PIN, LOW);
+  delay(PN532_RESET_ASSERT_MS);
+  digitalWrite(PN532_RESET_PIN, HIGH);
+  delay(PN532_RESET_BOOT_MS);
+  clearPn532Input();
 }
 
 static bool readByteUntil(uint8_t& value, uint32_t deadline) {
@@ -223,6 +284,95 @@ static bool readPn532Frame(
   return true;
 }
 
+static bool executeLocalPn532Command(
+    uint8_t command,
+    const uint8_t* commandData,
+    uint8_t commandDataLength,
+    uint16_t responseTimeoutMs,
+    uint8_t* responseData,
+    size_t& responseDataLength,
+    ErrorCode& error
+) {
+  const uint8_t frameDataLength =
+      static_cast<uint8_t>(commandDataLength + 2);
+  size_t frameLength = 0;
+  protocolBuffer[frameLength++] = 0x00;
+  protocolBuffer[frameLength++] = 0x00;
+  protocolBuffer[frameLength++] = 0xFF;
+  protocolBuffer[frameLength++] = frameDataLength;
+  protocolBuffer[frameLength++] =
+      static_cast<uint8_t>(0 - frameDataLength);
+  protocolBuffer[frameLength++] = 0xD4;
+  protocolBuffer[frameLength++] = command;
+  uint8_t checksum = static_cast<uint8_t>(0xD4 + command);
+  for (uint8_t i = 0; i < commandDataLength; i++) {
+    protocolBuffer[frameLength++] = commandData[i];
+    checksum = static_cast<uint8_t>(checksum + commandData[i]);
+  }
+  protocolBuffer[frameLength++] = static_cast<uint8_t>(0 - checksum);
+  protocolBuffer[frameLength++] = 0x00;
+
+  clearPn532Input();
+  Serial.write(protocolBuffer, frameLength);
+  Serial.flush();
+
+  size_t acknowledgementLength = 0;
+  if (!readPn532Frame(
+          250,
+          pn532AckFrame,
+          acknowledgementLength,
+          error
+      )) {
+    return false;
+  }
+  static const uint8_t ACK[] = {0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00};
+  if (acknowledgementLength != sizeof(ACK) ||
+      memcmp(pn532AckFrame, ACK, sizeof(ACK)) != 0) {
+    error = ErrorCode::PN532_BAD_ACK;
+    return false;
+  }
+
+  waitingForPn532Response = true;
+  size_t responseFrameLength = 0;
+  const bool received = readPn532Frame(
+      responseTimeoutMs,
+      pn532ResponseFrame,
+      responseFrameLength,
+      error
+  );
+  waitingForPn532Response = false;
+  if (!received) {
+    clearPn532Input();
+    return false;
+  }
+
+  // Atomic discovery commands and their responses are always normal frames.
+  if (responseFrameLength < 9 ||
+      pn532ResponseFrame[0] != 0x00 ||
+      pn532ResponseFrame[1] != 0x00 ||
+      pn532ResponseFrame[2] != 0xFF) {
+    error = ErrorCode::PN532_BAD_FRAME;
+    return false;
+  }
+  const size_t dataLength = pn532ResponseFrame[3];
+  if (dataLength < 2 ||
+      dataLength + 7 != responseFrameLength ||
+      pn532ResponseFrame[5] != 0xD5 ||
+      pn532ResponseFrame[6] != static_cast<uint8_t>(command + 1)) {
+    error = ErrorCode::PN532_BAD_FRAME;
+    return false;
+  }
+  responseDataLength = dataLength - 2;
+  if (responseDataLength > MAX_PROTOCOL_PAYLOAD) {
+    error = ErrorCode::PN532_FRAME_TOO_LARGE;
+    return false;
+  }
+  if (responseDataLength > 0) {
+    memcpy(responseData, pn532ResponseFrame + 7, responseDataLength);
+  }
+  return true;
+}
+
 static void sendProtocolMessage(
     MessageType type,
     uint32_t requestId,
@@ -323,6 +473,643 @@ static void handleReadFrame(const ProtocolMessage& message) {
   sendError(message.requestId, ErrorCode::UNSUPPORTED_TYPE);
 }
 
+static void handleDiscover(const ProtocolMessage& message) {
+  // Payload is one complete Home Key ECP frame including CRC-A. Keeping the
+  // entire PN532 sequence here removes six LAN round trips per discovery
+  // cycle while authentication remains under controller ownership.
+  if (message.payloadLength < 3 || message.payloadLength > 64 ||
+      waitingForPn532Response) {
+    sendError(
+        message.requestId,
+        waitingForPn532Response
+            ? ErrorCode::PN532_BUSY
+            : ErrorCode::BAD_MESSAGE
+    );
+    return;
+  }
+
+  static const uint8_t RF_FIELD_OFF[] = {0x01, 0x02};
+  static const uint8_t POLL_TYPE_A[] = {0x01, 0x00};
+  static const uint8_t DETECTION_RETRIES[] = {
+      0x05, 0xFF, 0x01, 0x00
+  };
+  static const uint8_t RF_TIMEOUTS[] = {0x02, 0x0A, 0x0B, 0x08};
+  static const uint8_t BIT_FRAMING[] = {0x63, 0x3D, 0x00};
+
+  ErrorCode error = ErrorCode::PN532_TIMEOUT;
+  size_t responseLength = 0;
+  auto execute = [&](
+      uint8_t command,
+      const uint8_t* data,
+      uint8_t dataLength,
+      uint16_t timeoutMs = PN532_LOCAL_RESPONSE_TIMEOUT_MS
+  ) {
+    responseLength = 0;
+    return executeLocalPn532Command(
+        command,
+        data,
+        dataLength,
+        timeoutMs,
+        pn532AckFrame,
+        responseLength,
+        error
+    );
+  };
+  auto sendTarget = [&]() {
+    if (responseLength + 1 > MAX_PROTOCOL_PAYLOAD) {
+      sendError(message.requestId, ErrorCode::PN532_FRAME_TOO_LARGE);
+      return;
+    }
+    memmove(pn532AckFrame + 1, pn532AckFrame, responseLength);
+    pn532AckFrame[0] = 1;
+    sendProtocolMessage(
+        MessageType::RESPONSE,
+        message.requestId,
+        0,
+        pn532AckFrame,
+        static_cast<uint16_t>(responseLength + 1)
+    );
+  };
+
+  if (!execute(
+          0x32,
+          RF_FIELD_OFF,
+          sizeof(RF_FIELD_OFF),
+          300
+      ) ||
+      !execute(0x4A, POLL_TYPE_A, sizeof(POLL_TYPE_A), 500)) {
+    sendError(message.requestId, error);
+    return;
+  }
+  if (responseLength > 0 && pn532AckFrame[0] > 0) {
+    sendTarget();
+    return;
+  }
+
+  if (!execute(
+          0x32,
+          DETECTION_RETRIES,
+          sizeof(DETECTION_RETRIES),
+          300
+      ) ||
+      !execute(0x32, RF_TIMEOUTS, sizeof(RF_TIMEOUTS), 300) ||
+      !execute(0x08, BIT_FRAMING, sizeof(BIT_FRAMING), 300) ||
+      !execute(
+          0x42,
+          message.payload,
+          static_cast<uint8_t>(message.payloadLength),
+          300
+      )) {
+    sendError(message.requestId, error);
+    return;
+  }
+
+  // End the ECP cycle with the field off and return immediately. The phone
+  // needs this field-off interval to transition into Home Key mode. Polling
+  // again inside this request both removed that interval and could block for
+  // another PN532 target-search timeout.
+  if (!execute(0x32, RF_FIELD_OFF, sizeof(RF_FIELD_OFF), 300)) {
+    sendError(message.requestId, error);
+    return;
+  }
+
+  const uint8_t noTarget = 0;
+  sendProtocolMessage(
+      MessageType::RESPONSE,
+      message.requestId,
+      0,
+      &noTarget,
+      sizeof(noTarget)
+  );
+}
+
+static void handleStartDiscovery(const ProtocolMessage& message) {
+  if (message.payloadLength < 3 ||
+      message.payloadLength > sizeof(discoveryFrame) ||
+      waitingForPn532Response) {
+    sendError(
+        message.requestId,
+        waitingForPn532Response
+            ? ErrorCode::PN532_BUSY
+            : ErrorCode::BAD_MESSAGE
+    );
+    return;
+  }
+  memcpy(discoveryFrame, message.payload, message.payloadLength);
+  discoveryFrameLength = static_cast<uint8_t>(message.payloadLength);
+  autonomousDiscoveryEnabled = true;
+  discoveryTargetPending = false;
+  discoveryWaitForRemoval = false;
+  consecutiveDiscoveryFailures = 0;
+  nextDiscoveryAt = millis();
+  sendProtocolMessage(
+      MessageType::RESPONSE, message.requestId, 0, nullptr, 0
+  );
+}
+
+static void handleResumeDiscovery(const ProtocolMessage& message) {
+  if (message.payloadLength > 1 ||
+      (message.payloadLength == 1 && message.payload[0] > 1) ||
+      !autonomousDiscoveryEnabled) {
+    sendError(message.requestId, ErrorCode::BAD_MESSAGE);
+    return;
+  }
+  const bool retry = (
+      message.payloadLength == 1 && message.payload[0] == 1
+  );
+  if (retry) {
+    static const uint8_t RF_FIELD_OFF[] = {0x01, 0x02};
+    ErrorCode error = ErrorCode::PN532_TIMEOUT;
+    size_t responseLength = 0;
+    if (!executeLocalPn532Command(
+            0x32,
+            RF_FIELD_OFF,
+            sizeof(RF_FIELD_OFF),
+            300,
+            pn532AckFrame,
+            responseLength,
+            error
+        )) {
+      sendError(message.requestId, error);
+      return;
+    }
+  }
+  discoveryTargetPending = false;
+  discoveryWaitForRemoval = !retry;
+  discoveryNoTargetSince = 0;
+  consecutiveDiscoveryFailures = 0;
+  nextDiscoveryAt = millis() + (
+      retry ? DISCOVERY_RETRY_DELAY_MS : DISCOVERY_INTERVAL_MS
+  );
+  sendProtocolMessage(
+      MessageType::RESPONSE, message.requestId, 0, nullptr, 0
+  );
+}
+
+enum class AsyncCommandResult : uint8_t {
+  PENDING,
+  COMPLETE,
+  FAILED,
+};
+
+static void resetAsyncFrameCollector() {
+  asyncPn532.frameLength = 0;
+  asyncPn532.syncState = 0;
+}
+
+static AsyncCommandResult collectAsyncPn532Frame(ErrorCode& error) {
+  uint8_t value = 0;
+  while (ringPop(value)) {
+    if (asyncPn532.frameLength == 0) {
+      if (asyncPn532.syncState == 0) {
+        asyncPn532.syncState = value == 0x00 ? 1 : 0;
+      } else if (asyncPn532.syncState == 1) {
+        asyncPn532.syncState = value == 0x00 ? 2 : 0;
+      } else if (value == 0xFF) {
+        pn532ResponseFrame[0] = 0x00;
+        pn532ResponseFrame[1] = 0x00;
+        pn532ResponseFrame[2] = 0xFF;
+        asyncPn532.frameLength = 3;
+      } else {
+        asyncPn532.syncState = value == 0x00 ? 2 : 0;
+      }
+      continue;
+    }
+
+    if (asyncPn532.frameLength >= MAX_PROTOCOL_PAYLOAD) {
+      error = ErrorCode::PN532_FRAME_TOO_LARGE;
+      return AsyncCommandResult::FAILED;
+    }
+    pn532ResponseFrame[asyncPn532.frameLength++] = value;
+
+    if (asyncPn532.frameLength == 6 &&
+        pn532ResponseFrame[3] == 0x00 &&
+        pn532ResponseFrame[4] == 0xFF &&
+        pn532ResponseFrame[5] == 0x00) {
+      return AsyncCommandResult::COMPLETE;
+    }
+
+    size_t expectedLength = 0;
+    if (asyncPn532.frameLength >= 5 &&
+        !(pn532ResponseFrame[3] == 0xFF &&
+          pn532ResponseFrame[4] == 0xFF)) {
+      expectedLength =
+          static_cast<size_t>(pn532ResponseFrame[3]) + 7;
+    } else if (asyncPn532.frameLength >= 7) {
+      const size_t dataLength =
+          (static_cast<size_t>(pn532ResponseFrame[5]) << 8) |
+          pn532ResponseFrame[6];
+      expectedLength = dataLength + 10;
+    }
+
+    if (expectedLength > MAX_PROTOCOL_PAYLOAD) {
+      error = ErrorCode::PN532_FRAME_TOO_LARGE;
+      return AsyncCommandResult::FAILED;
+    }
+    if (expectedLength != 0 &&
+        asyncPn532.frameLength == expectedLength) {
+      return AsyncCommandResult::COMPLETE;
+    }
+  }
+
+  if (static_cast<int32_t>(millis() - asyncPn532.deadline) >= 0) {
+    error = ErrorCode::PN532_TIMEOUT;
+    return AsyncCommandResult::FAILED;
+  }
+  return AsyncCommandResult::PENDING;
+}
+
+static bool beginAsyncPn532Command(
+    uint8_t command,
+    const uint8_t* commandData,
+    uint8_t commandDataLength,
+    uint16_t responseTimeoutMs
+) {
+  if (asyncPn532.active) {
+    return false;
+  }
+
+  const uint8_t frameDataLength =
+      static_cast<uint8_t>(commandDataLength + 2);
+  size_t frameLength = 0;
+  protocolBuffer[frameLength++] = 0x00;
+  protocolBuffer[frameLength++] = 0x00;
+  protocolBuffer[frameLength++] = 0xFF;
+  protocolBuffer[frameLength++] = frameDataLength;
+  protocolBuffer[frameLength++] =
+      static_cast<uint8_t>(0 - frameDataLength);
+  protocolBuffer[frameLength++] = 0xD4;
+  protocolBuffer[frameLength++] = command;
+  uint8_t checksum = static_cast<uint8_t>(0xD4 + command);
+  for (uint8_t i = 0; i < commandDataLength; i++) {
+    protocolBuffer[frameLength++] = commandData[i];
+    checksum = static_cast<uint8_t>(checksum + commandData[i]);
+  }
+  protocolBuffer[frameLength++] = static_cast<uint8_t>(0 - checksum);
+  protocolBuffer[frameLength++] = 0x00;
+
+  clearPn532Input();
+  waitingForPn532Response = true;
+  asyncPn532.active = true;
+  asyncPn532.phase = AsyncFramePhase::WAIT_ACK;
+  asyncPn532.command = command;
+  asyncPn532.responseTimeoutMs =
+      max<uint16_t>(responseTimeoutMs, 50);
+  asyncPn532.deadline = millis() + 250;
+  resetAsyncFrameCollector();
+  Serial.write(protocolBuffer, frameLength);
+  Serial.flush();
+  return true;
+}
+
+static AsyncCommandResult pollAsyncPn532Command(
+    size_t& responseLength,
+    ErrorCode& error
+) {
+  responseLength = 0;
+  if (!asyncPn532.active) {
+    error = ErrorCode::PN532_BAD_FRAME;
+    return AsyncCommandResult::FAILED;
+  }
+
+  const AsyncCommandResult frameResult =
+      collectAsyncPn532Frame(error);
+  if (frameResult != AsyncCommandResult::COMPLETE) {
+    if (frameResult == AsyncCommandResult::FAILED) {
+      // PN532 ACK also aborts a command still waiting inside the chip.
+      static const uint8_t ACK[] = {
+          0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00
+      };
+      Serial.write(ACK, sizeof(ACK));
+      Serial.flush();
+      asyncPn532.active = false;
+      clearPn532Input();
+    }
+    return frameResult;
+  }
+
+  if (asyncPn532.phase == AsyncFramePhase::WAIT_ACK) {
+    static const uint8_t ACK[] = {
+        0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00
+    };
+    if (asyncPn532.frameLength != sizeof(ACK) ||
+        memcmp(pn532ResponseFrame, ACK, sizeof(ACK)) != 0) {
+      error = ErrorCode::PN532_BAD_ACK;
+      asyncPn532.active = false;
+      return AsyncCommandResult::FAILED;
+    }
+    asyncPn532.phase = AsyncFramePhase::WAIT_RESPONSE;
+    asyncPn532.deadline =
+        millis() + asyncPn532.responseTimeoutMs;
+    resetAsyncFrameCollector();
+    return AsyncCommandResult::PENDING;
+  }
+
+  if (!validateNormalFrame(
+          pn532ResponseFrame, asyncPn532.frameLength
+      ) ||
+      asyncPn532.frameLength < 9) {
+    error = ErrorCode::PN532_BAD_FRAME;
+    asyncPn532.active = false;
+    return AsyncCommandResult::FAILED;
+  }
+  const size_t dataLength = pn532ResponseFrame[3];
+  if (dataLength < 2 ||
+      dataLength + 7 != asyncPn532.frameLength ||
+      pn532ResponseFrame[5] != 0xD5 ||
+      pn532ResponseFrame[6] !=
+          static_cast<uint8_t>(asyncPn532.command + 1)) {
+    error = ErrorCode::PN532_BAD_FRAME;
+    asyncPn532.active = false;
+    return AsyncCommandResult::FAILED;
+  }
+
+  responseLength = dataLength - 2;
+  if (responseLength > MAX_PROTOCOL_PAYLOAD) {
+    error = ErrorCode::PN532_FRAME_TOO_LARGE;
+    asyncPn532.active = false;
+    return AsyncCommandResult::FAILED;
+  }
+  if (responseLength > 0) {
+    memcpy(
+        pn532AckFrame, pn532ResponseFrame + 7, responseLength
+    );
+  }
+  asyncPn532.active = false;
+  return AsyncCommandResult::COMPLETE;
+}
+
+static void finishAsyncTransceive(ErrorCode error, bool success) {
+  const uint32_t requestId = transceiveRequestId;
+  cancelAsyncTransceive();
+  clearPn532Input();
+  if (!success) {
+    sendError(requestId, error);
+  }
+}
+
+static void handleTransceive(const ProtocolMessage& message) {
+  if (message.payloadLength == 0 || message.payloadLength > 250 ||
+      message.timeoutMs == 0 ||
+      waitingForPn532Response || !discoveryTargetPending) {
+    sendError(
+        message.requestId,
+        waitingForPn532Response
+            ? ErrorCode::PN532_BUSY
+            : ErrorCode::BAD_MESSAGE
+    );
+    return;
+  }
+
+  memcpy(
+      transceivePayload, message.payload, message.payloadLength
+  );
+  transceivePayloadLength =
+      static_cast<uint8_t>(message.payloadLength);
+  transceiveTimeoutMs = message.timeoutMs;
+  transceiveRequestId = message.requestId;
+  transceiveStep = TransceiveStep::READ_REGISTERS;
+
+  static const uint8_t READ_RF_REGISTERS[] = {
+      0x63, 0x02, 0x63, 0x03, 0x63, 0x05
+  };
+  if (!beginAsyncPn532Command(
+          0x06,
+          READ_RF_REGISTERS,
+          sizeof(READ_RF_REGISTERS),
+          300
+      )) {
+    finishAsyncTransceive(ErrorCode::PN532_BUSY, false);
+  }
+}
+
+static void updateAsyncTransceive() {
+  if (transceiveStep == TransceiveStep::IDLE) {
+    return;
+  }
+
+  size_t responseLength = 0;
+  ErrorCode error = ErrorCode::PN532_TIMEOUT;
+  const AsyncCommandResult result =
+      pollAsyncPn532Command(responseLength, error);
+  if (result == AsyncCommandResult::PENDING) {
+    return;
+  }
+  if (result == AsyncCommandResult::FAILED) {
+    finishAsyncTransceive(error, false);
+    return;
+  }
+
+  if (transceiveStep == TransceiveStep::READ_REGISTERS) {
+    if (responseLength != 3) {
+      finishAsyncTransceive(ErrorCode::PN532_BAD_FRAME, false);
+      return;
+    }
+    const uint8_t writeRfRegisters[] = {
+        0x63, 0x02, static_cast<uint8_t>(pn532AckFrame[0] & 0x8C),
+        0x63, 0x03, static_cast<uint8_t>(pn532AckFrame[1] & 0x8C),
+        0x63, 0x05,
+        static_cast<uint8_t>((pn532AckFrame[2] & 0xBF) | 0x40),
+    };
+    transceiveStep = TransceiveStep::WRITE_REGISTERS;
+    if (!beginAsyncPn532Command(
+            0x08,
+            writeRfRegisters,
+            sizeof(writeRfRegisters),
+            300
+        )) {
+      finishAsyncTransceive(ErrorCode::PN532_BUSY, false);
+    }
+    return;
+  }
+
+  if (transceiveStep == TransceiveStep::WRITE_REGISTERS) {
+    const uint32_t timeoutMicroseconds =
+        static_cast<uint32_t>(transceiveTimeoutMs) * 1000UL;
+    uint8_t timeoutIndex = 16;
+    for (uint8_t index = 0; index < 16; index++) {
+      if ((timeoutMicroseconds >> index) <= 100) {
+        timeoutIndex = index + 1;
+        break;
+      }
+    }
+    const uint8_t rfTimeouts[] = {
+        0x02, 0x0A, 0x0B, timeoutIndex
+    };
+    transceiveStep = TransceiveStep::CONFIGURE_TIMEOUT;
+    if (!beginAsyncPn532Command(
+            0x32, rfTimeouts, sizeof(rfTimeouts), 300
+        )) {
+      finishAsyncTransceive(ErrorCode::PN532_BUSY, false);
+    }
+    return;
+  }
+
+  if (transceiveStep == TransceiveStep::CONFIGURE_TIMEOUT) {
+    const uint16_t localTimeout = static_cast<uint16_t>(
+        min<uint32_t>(
+            static_cast<uint32_t>(transceiveTimeoutMs) + 150UL,
+            0xFFFFUL
+        )
+    );
+    transceiveStep = TransceiveStep::EXCHANGE;
+    if (!beginAsyncPn532Command(
+            0x42,
+            transceivePayload,
+            transceivePayloadLength,
+            localTimeout
+        )) {
+      finishAsyncTransceive(ErrorCode::PN532_BUSY, false);
+    }
+    return;
+  }
+
+  if (responseLength == 0) {
+    finishAsyncTransceive(ErrorCode::PN532_BAD_FRAME, false);
+    return;
+  }
+  const uint32_t requestId = transceiveRequestId;
+  cancelAsyncTransceive();
+  // InCommunicateThru returns status followed by RF response data.
+  sendProtocolMessage(
+      MessageType::RESPONSE,
+      requestId,
+      0,
+      pn532AckFrame,
+      static_cast<uint16_t>(responseLength)
+  );
+}
+
+static void autonomousDiscoveryFailure() {
+  consecutiveDiscoveryFailures++;
+  nextDiscoveryAt = millis() + 100;
+  if (consecutiveDiscoveryFailures < DISCOVERY_FAILURE_LIMIT) {
+    return;
+  }
+  autonomousDiscoveryEnabled = false;
+  discoveryTargetPending = false;
+  discoveryWaitForRemoval = false;
+  // Reconnecting makes the controller reinitialize the PN532 and configure
+  // autonomous discovery again. It also prevents a failed radio loop from
+  // silently remaining unavailable.
+  webSocket.disconnect();
+}
+
+static void runAutonomousDiscovery() {
+  if (!autonomousDiscoveryEnabled || !websocketConnected ||
+      otaInProgress || waitingForPn532Response ||
+      discoveryFrameLength == 0) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (discoveryTargetPending) {
+    if (now - discoveryTargetPendingAt <
+        DISCOVERY_TARGET_WATCHDOG_MS) {
+      return;
+    }
+    // The controller disappeared or failed to resume after authentication.
+    discoveryTargetPending = false;
+    discoveryWaitForRemoval = true;
+  }
+  if (static_cast<int32_t>(now - nextDiscoveryAt) < 0) {
+    return;
+  }
+
+  static const uint8_t RF_FIELD_OFF[] = {0x01, 0x02};
+  static const uint8_t POLL_TYPE_A[] = {0x01, 0x00};
+  static const uint8_t DETECTION_RETRIES[] = {
+      0x05, 0xFF, 0x01, 0x00
+  };
+  static const uint8_t RF_TIMEOUTS[] = {0x02, 0x0A, 0x0B, 0x08};
+  static const uint8_t BIT_FRAMING[] = {0x63, 0x3D, 0x00};
+
+  ErrorCode error = ErrorCode::PN532_TIMEOUT;
+  size_t responseLength = 0;
+  auto execute = [&](
+      uint8_t command,
+      const uint8_t* data,
+      uint8_t dataLength,
+      uint16_t timeoutMs
+  ) {
+    responseLength = 0;
+    return executeLocalPn532Command(
+        command,
+        data,
+        dataLength,
+        timeoutMs,
+        pn532AckFrame,
+        responseLength,
+        error
+    );
+  };
+
+  if (!execute(0x32, RF_FIELD_OFF, sizeof(RF_FIELD_OFF), 300) ||
+      !execute(0x4A, POLL_TYPE_A, sizeof(POLL_TYPE_A), 500)) {
+    autonomousDiscoveryFailure();
+    return;
+  }
+
+  if (responseLength > 0 && pn532AckFrame[0] > 0) {
+    consecutiveDiscoveryFailures = 0;
+    if (discoveryWaitForRemoval) {
+      discoveryNoTargetSince = 0;
+      nextDiscoveryAt = millis() + DISCOVERY_INTERVAL_MS;
+      return;
+    }
+    if (responseLength + 1 > MAX_PROTOCOL_PAYLOAD) {
+      autonomousDiscoveryFailure();
+      return;
+    }
+    memmove(pn532AckFrame + 1, pn532AckFrame, responseLength);
+    pn532AckFrame[0] = 1;
+    const uint32_t requestId = nextTargetEventRequestId++;
+    sendProtocolMessage(
+        MessageType::TARGET_EVENT,
+        requestId,
+        0,
+        pn532AckFrame,
+        static_cast<uint16_t>(responseLength + 1)
+    );
+    discoveryTargetPending = true;
+    discoveryTargetPendingAt = millis();
+    return;
+  }
+
+  if (discoveryWaitForRemoval) {
+    if (discoveryNoTargetSince == 0) {
+      discoveryNoTargetSince = millis();
+    }
+    if (millis() - discoveryNoTargetSince <
+        DISCOVERY_REMOVAL_CONFIRM_MS) {
+      nextDiscoveryAt = millis() + DISCOVERY_INTERVAL_MS;
+      return;
+    }
+    discoveryWaitForRemoval = false;
+    discoveryNoTargetSince = 0;
+  }
+  if (!execute(
+          0x32,
+          DETECTION_RETRIES,
+          sizeof(DETECTION_RETRIES),
+          300
+      ) ||
+      !execute(0x32, RF_TIMEOUTS, sizeof(RF_TIMEOUTS), 300) ||
+      !execute(0x08, BIT_FRAMING, sizeof(BIT_FRAMING), 300) ||
+      !execute(
+          0x42,
+          discoveryFrame,
+          discoveryFrameLength,
+          300
+      ) ||
+      !execute(0x32, RF_FIELD_OFF, sizeof(RF_FIELD_OFF), 300)) {
+    autonomousDiscoveryFailure();
+    return;
+  }
+  consecutiveDiscoveryFailures = 0;
+  nextDiscoveryAt = millis() + DISCOVERY_INTERVAL_MS;
+}
+
 static void handleAccessResult(const ProtocolMessage& message) {
   // Payload: granted (u8), unlock duration (u32 big-endian). The access
   // controller performs the actual door action; this is local feedback only.
@@ -379,11 +1166,22 @@ static void handleBinaryMessage(uint8_t* payload, size_t length) {
       handleReadFrame(message);
       break;
     case MessageType::RESET:
-      waitingForPn532Response = false;
-      clearPn532Input();
+      hardwareResetPn532();
       sendProtocolMessage(
           MessageType::RESPONSE, message.requestId, 0, nullptr, 0
       );
+      break;
+    case MessageType::DISCOVER:
+      handleDiscover(message);
+      break;
+    case MessageType::START_DISCOVERY:
+      handleStartDiscovery(message);
+      break;
+    case MessageType::RESUME_DISCOVERY:
+      handleResumeDiscovery(message);
+      break;
+    case MessageType::TRANSCEIVE:
+      handleTransceive(message);
       break;
     case MessageType::ACCESS_RESULT:
       handleAccessResult(message);
@@ -439,13 +1237,16 @@ static void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED:
       websocketConnected = true;
-      waitingForPn532Response = false;
+      cancelAsyncTransceive();
       clearPn532Input();
       sendHello();
       break;
     case WStype_DISCONNECTED:
       websocketConnected = false;
-      waitingForPn532Response = false;
+      cancelAsyncTransceive();
+      autonomousDiscoveryEnabled = false;
+      discoveryTargetPending = false;
+      discoveryWaitForRemoval = false;
       if (buttonPending) {
         buttonPending = false;
         lastAccessGranted = false;
@@ -486,7 +1287,7 @@ static void startOtaIfNeeded() {
   ArduinoOTA.onStart([]() {
     otaInProgress = true;
     websocketConnected = false;
-    waitingForPn532Response = false;
+    cancelAsyncTransceive();
     clearPn532Input();
     webSocket.disconnect();
   });
@@ -508,7 +1309,7 @@ static void configureHttpUpdates() {
   ESPhttpUpdate.onStart([]() {
     otaInProgress = true;
     websocketConnected = false;
-    waitingForPn532Response = false;
+    cancelAsyncTransceive();
     buttonPending = false;
     clearPn532Input();
     webSocket.disconnect();
@@ -641,12 +1442,17 @@ void setup() {
   pinMode(STATUS_LED_PIN, OUTPUT);
   setStatusLed(false);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+  // Set the inactive level before changing the pin to output, avoiding an
+  // unintended reset pulse during GPIO initialization.
+  digitalWrite(PN532_RESET_PIN, HIGH);
+  pinMode(PN532_RESET_PIN, OUTPUT);
   buttonRawPressed = digitalRead(BUTTON_PIN) == LOW;
   buttonStablePressed = buttonRawPressed;
 
   Serial.setRxBufferSize(PN532_RING_SIZE);
   Serial.begin(PN532_BAUD_RATE, SERIAL_8N1);
   Serial.setTimeout(2);
+  hardwareResetPn532();
 
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
@@ -683,8 +1489,10 @@ void loop() {
   }
   webSocket.loop();
   updateButton();
-  updateStatusLed();
   drainPn532Uart();
+  updateAsyncTransceive();
+  runAutonomousDiscovery();
+  updateStatusLed();
   checkFirmwareUpdateIfDue();
 
 #if SERIAL_DIAGNOSTICS

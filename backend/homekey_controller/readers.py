@@ -8,8 +8,9 @@ import time
 import uuid
 from dataclasses import dataclass
 
-from homekey_bridge.protocol import MessageType, normalize_reader_id
+from homekey_bridge.protocol import ErrorCode, MessageType, normalize_reader_id
 from homekey_bridge.server import (
+    ReaderCommandError,
     ReaderManager,
     ReaderUnavailable,
 )
@@ -36,6 +37,7 @@ from util.digital_key import (  # noqa: E402
 )
 from util.ecp import ECP  # noqa: E402
 from util.iso7816 import ISO7816Tag  # noqa: E402
+from util.nfc import with_crc16a  # noqa: E402
 
 
 log = logging.getLogger(__name__)
@@ -55,6 +57,41 @@ def install_websocket_nfc_transport(manager: ReaderManager) -> None:
             reader_id = normalize_reader_id(path[len(prefix) :])
             transport = WebSocketPn532Transport(manager, reader_id)
             device = pn532_module.init(transport)
+            original_exchange = device.send_cmd_recv_rsp
+
+            def send_cmd_recv_rsp(target, data, timeout):
+                if (
+                    target.brty == "106A"
+                    and target.sel_res
+                    and target.sel_res[0] & 0x20
+                ):
+                    try:
+                        status, response = transport.transceive(
+                            data, timeout
+                        )
+                    except ReaderCommandError as error:
+                        if error.code == ErrorCode.UNSUPPORTED_TYPE:
+                            return original_exchange(
+                                target, data, timeout
+                            )
+                        raise
+                    if status == 0:
+                        return response
+                    if status == 1:
+                        raise nfc.clf.TimeoutError
+                    if status == 0x0B:
+                        # PN532 reports that the ISO-DEP protocol state is
+                        # broken. NAK retransmissions cannot repair this; end
+                        # the session so discovery can perform a clean retry.
+                        raise nfc.clf.ProtocolError(
+                            "PN532 RF protocol error"
+                        )
+                    raise nfc.clf.TransmissionError(
+                        f"PN532 RF status 0x{status:02X}"
+                    )
+                return original_exchange(target, data, timeout)
+
+            device.send_cmd_recv_rsp = send_cmd_recv_rsp
             device._path = path
             return device
         return original_connect(path)
@@ -100,6 +137,7 @@ class ReaderWorker:
             broadcast_enabled=True,
         )
         self._consecutive_failures = 0
+        self._autonomous_discovery = False
 
     def start(self) -> None:
         self.thread.start()
@@ -233,13 +271,43 @@ class ReaderWorker:
 
     def _poll_once(self) -> None:
         started = time.monotonic()
-        remote_target = self.clf.sense(
-            RemoteTarget("106A"),
-            broadcast=ECP.home(
-                identifier=self.store.get_reader_group_identifier(),
-                flag_2=True,
-            ).pack(),
-        )
+        broadcast = ECP.home(
+            identifier=self.store.get_reader_group_identifier(),
+            flag_2=True,
+        ).pack()
+        if self._autonomous_discovery:
+            connection = self.manager.get(self.reader_id)
+            if connection is None:
+                raise ReaderUnavailable(
+                    f"reader {self.reader_id} is disconnected"
+                )
+            discovery = connection.wait_for_target(timeout=0.5)
+            if discovery is None:
+                return
+            remote_target = self._decode_discovery(discovery)
+            self.clf.target = remote_target
+        else:
+            try:
+                connection = self.manager.get(self.reader_id)
+                if connection is None:
+                    raise ReaderUnavailable(
+                        f"reader {self.reader_id} is disconnected"
+                    )
+                discovery = connection.request(
+                    MessageType.DISCOVER,
+                    payload=with_crc16a(broadcast),
+                    timeout_ms=1500,
+                )
+                remote_target = self._decode_discovery(discovery)
+                self.clf.target = remote_target
+            except ReaderCommandError as error:
+                # Firmware before 2.6.0 does not have local ECP discovery.
+                if error.code != ErrorCode.UNSUPPORTED_TYPE:
+                    raise
+                remote_target = self.clf.sense(
+                    RemoteTarget("106A"),
+                    broadcast=broadcast,
+                )
         if remote_target is None:
             time.sleep(
                 max(
@@ -251,10 +319,12 @@ class ReaderWorker:
             )
             return
 
-        target = activate(self.clf, remote_target)
-        if target is None:
-            return
+        target = None
+        transaction_completed = False
         try:
+            target = activate(self.clf, remote_target)
+            if target is None:
+                return
             if not isinstance(target, ISODEPTag):
                 card_uid = target.identifier.hex().upper()
                 log.info(
@@ -273,11 +343,13 @@ class ReaderWorker:
                         ) * 1000,
                     )
                 )
+                transaction_completed = True
             else:
                 try:
                     result = self._authenticate(target)
                     if result is not None:
                         self._decide_access(result)
+                        transaction_completed = True
                 except ProtocolError as error:
                     log.info(
                         "Reader %s rejected Home Key protocol: %s",
@@ -285,18 +357,79 @@ class ReaderWorker:
                         error,
                     )
         finally:
-            # This must also run when ISO-DEP raises. Retrying while the same
-            # phone remains in the field causes a rapid sequence of broken
-            # sessions and makes RF recovery substantially worse.
-            try:
-                while (
-                    not self.stop_event.is_set()
-                    and target.is_present
-                ):
-                    time.sleep(0.25)
-            except Exception:
-                pass
-            time.sleep(0.5)
+            if self._autonomous_discovery:
+                connection = self.manager.get(self.reader_id)
+                if connection is not None:
+                    connection.request(
+                        MessageType.RESUME_DISCOVERY,
+                        payload=bytes(
+                            [0 if transaction_completed else 1]
+                        ),
+                        timeout_ms=500,
+                    )
+            else:
+                # This must also run when ISO-DEP raises. Retrying while the
+                # same phone remains in the field causes a rapid sequence of
+                # broken sessions and makes RF recovery substantially worse.
+                if target is not None:
+                    try:
+                        while (
+                            not self.stop_event.is_set()
+                            and target.is_present
+                        ):
+                            time.sleep(0.25)
+                    except Exception:
+                        pass
+                time.sleep(0.5)
+
+    def _start_autonomous_discovery(self) -> bool:
+        connection = self.manager.get(self.reader_id)
+        if connection is None:
+            raise ReaderUnavailable(
+                f"reader {self.reader_id} is disconnected"
+            )
+        broadcast = ECP.home(
+            identifier=self.store.get_reader_group_identifier(),
+            flag_2=True,
+        ).pack()
+        try:
+            connection.clear_target_events()
+            connection.request(
+                MessageType.START_DISCOVERY,
+                payload=with_crc16a(broadcast),
+                timeout_ms=500,
+            )
+        except ReaderCommandError as error:
+            if error.code == ErrorCode.UNSUPPORTED_TYPE:
+                return False
+            raise
+        return True
+
+    @staticmethod
+    def _decode_discovery(payload: bytes) -> RemoteTarget | None:
+        """Decode a local PN532 InListPassiveTarget discovery result."""
+        if payload == b"\x00":
+            return None
+        if len(payload) < 8 or payload[0] != 1:
+            raise IOError("reader returned an invalid discovery response")
+
+        # Remaining bytes are the PN532 InListPassiveTarget response:
+        # NbTg, Tg, SENS_RES[2], SEL_RES, NFCIDLength, NFCID, ATS...
+        response = payload[1:]
+        if response[0] < 1 or response[1] != 1:
+            raise IOError("reader returned an invalid Type-A target")
+        target_data = response[2:]
+        uid_length = target_data[3]
+        if uid_length not in (4, 7, 10):
+            raise IOError("reader returned an invalid Type-A UID")
+        if len(target_data) < 4 + uid_length:
+            raise IOError("reader returned a truncated Type-A target")
+        return RemoteTarget(
+            "106A",
+            sens_res=target_data[1::-1],
+            sel_res=target_data[2:3],
+            sdd_res=target_data[4:],
+        )
 
     def _is_transient(self, error: BaseException) -> bool:
         if isinstance(
@@ -317,6 +450,12 @@ class ReaderWorker:
                 f"PN532 {self.reader_id} did not initialize"
             )
         log.info("Reader %s PN532 ready", self.reader_id)
+        self._autonomous_discovery = self._start_autonomous_discovery()
+        if self._autonomous_discovery:
+            log.info(
+                "Reader %s autonomous discovery active",
+                self.reader_id,
+            )
         while not self.stop_event.is_set():
             try:
                 self._poll_once()

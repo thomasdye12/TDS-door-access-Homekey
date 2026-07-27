@@ -99,6 +99,9 @@ class ReaderConnection:
         self._send_lock = threading.Lock()
         self._pending_lock = threading.Lock()
         self._pending: dict[int, queue.Queue[Message | BaseException]] = {}
+        self._target_events: queue.Queue[bytes | BaseException] = queue.Queue(
+            maxsize=1
+        )
         self._next_request_id = 1
         self.closed = threading.Event()
 
@@ -184,6 +187,31 @@ class ReaderConnection:
             return
         response_queue.put_nowait(message)
 
+    def dispatch_target(self, payload: bytes) -> None:
+        try:
+            self._target_events.put_nowait(payload)
+        except queue.Full:
+            log.warning(
+                "Dropping duplicate target event from %s",
+                self.record.reader_id,
+            )
+
+    def wait_for_target(self, timeout: float) -> bytes | None:
+        try:
+            event = self._target_events.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        if isinstance(event, BaseException):
+            raise ReaderUnavailable(str(event)) from event
+        return event
+
+    def clear_target_events(self) -> None:
+        while True:
+            try:
+                self._target_events.get_nowait()
+            except queue.Empty:
+                return
+
     def fail_pending(self, error: BaseException) -> None:
         with self._pending_lock:
             queues = list(self._pending.values())
@@ -192,6 +220,10 @@ class ReaderConnection:
                 response_queue.put_nowait(error)
             except queue.Full:
                 pass
+        try:
+            self._target_events.put_nowait(error)
+        except queue.Full:
+            pass
         self.closed.set()
 
 
@@ -326,6 +358,12 @@ class ReaderWebSocketServer:
                         connection,
                         message.request_id,
                     )
+                elif message.type == MessageType.TARGET_EVENT:
+                    if not message.payload:
+                        raise ValueError(
+                            "target event payload must not be empty"
+                        )
+                    connection.dispatch_target(message.payload)
                 else:
                     connection.dispatch(message)
         except (ConnectionClosed, TimeoutError):

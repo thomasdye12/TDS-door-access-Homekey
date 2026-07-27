@@ -64,6 +64,19 @@ class FakeStore:
 
 
 class ReaderDecisionTests(unittest.TestCase):
+    def test_decodes_local_type_a_discovery(self) -> None:
+        # status, NbTg, Tg, SENS_RES, SEL_RES, UID length, UID
+        payload = bytes.fromhex("0101014400200404A1B2C3")
+        target = ReaderWorker._decode_discovery(payload)
+
+        self.assertIsNotNone(target)
+        self.assertEqual(bytes(target.sens_res), bytes.fromhex("0044"))
+        self.assertEqual(bytes(target.sel_res), bytes.fromhex("20"))
+        self.assertEqual(bytes(target.sdd_res), bytes.fromhex("04A1B2C3"))
+
+    def test_decodes_no_local_target(self) -> None:
+        self.assertIsNone(ReaderWorker._decode_discovery(b"\x00"))
+
     def test_rfid_uid_uses_api_audit_and_reader_feedback(self) -> None:
         manager = FakeManager()
         store = FakeStore()
