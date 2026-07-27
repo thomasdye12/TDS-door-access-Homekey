@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Install backend dependencies
+        run: python -m pip install -r backend/requirements.txt
+      - name: Run tests
+        env:
+          PYTHONPATH: backend
+        run: |
+          python -m unittest discover -s tests/controller -p 'test_*.py' -v
+          python -m unittest discover -s tests/websocket -p 'test_*.py' -v
+
+  firmware:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: firmware/esp8266-pn532-websocket
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install PlatformIO
+        run: python -m pip install platformio
+      - name: Create CI-only secrets file
+        run: cp include/secrets.example.h include/secrets.h
+      - name: Build standard firmware
+        run: pio run -e websocket
+      - name: Build diagnostic firmware
+        run: pio run -e diagnostic
+      - name: Build ArduinoOTA migration firmware
+        env:
+          HOMEKEY_OTA_AUTH: ci-build-token
+        run: pio run -e ota

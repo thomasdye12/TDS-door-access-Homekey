@@ -1,0 +1,30 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+*.log
+.coverage
+htmlcov/
+
+# Local Wi-Fi credentials copied from secrets.example.h.
+firmware/esp8266-pn532-bridge/include/secrets.h
+firmware/esp8266-pn532-websocket/include/secrets.h
+backend/config/readers.json
+backend/config/controller.json
+backend/config/controller.key
+backend/config/controller.sqlite3
+backend/config/controller.sqlite3-shm
+backend/config/controller.sqlite3-wal
+backend/config/homekit.state
+backend/config/firmware/
+
+# PlatformIO build and editor state.
+.pio/
+.vscode/
+
+# Runtime state from the PTY bridge.
+*.runtime.json
+tools/access_api_test.curl.txt
+tools/access_api_test.json

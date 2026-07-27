@@ -1,0 +1,38 @@
+{
+  "controller_id": "main-building",
+  "door_id": "shared-home-key-door",
+  "reader_registry": "readers.json",
+  "database": {
+    "path": "controller.sqlite3",
+    "encryption_key_file": "controller.key"
+  },
+  "websocket": {
+    "host": "0.0.0.0",
+    "port": 8765
+  },
+  "homekit": {
+    "enabled": true,
+    "port": 51926,
+    "persist_file": "homekit.state",
+    "display_name": "Home Key Registration"
+  },
+  "access_api": {
+    "url": "http://127.0.0.1:8080/api/access/home-key",
+    "bearer_token": "replace-with-controller-api-token",
+    "timeout_seconds": 0.75,
+    "unavailable_decision": "deny"
+  },
+  "button_api": {
+    "url": "http://127.0.0.1:8080/api/doorbell",
+    "bearer_token": "replace-with-button-api-token",
+    "timeout_seconds": 1.5
+  },
+  "firmware_server": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 8766,
+    "manifest_path": "firmware/manifest.json",
+    "admin_token": "replace-with-a-long-random-admin-token"
+  },
+  "throttle_polling": 0.1
+}

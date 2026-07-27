@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tds.door-access-controller</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/tds-door-access/backend/.venv/bin/python</string>
+    <string>/opt/tds-door-access/backend/run_controller.py</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/opt/tds-door-access</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>/opt/tds-door-access/backend</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/var/log/tds-door-access.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/tds-door-access-error.log</string>
+</dict>
+</plist>

@@ -1,0 +1,9 @@
+TDS Door Access V2
+
+This product includes software derived from kormax/apple-home-key-reader,
+licensed under the Apache License 2.0. The vendored source, license and
+modification notes are retained under backend/vendor/apple_home_key_reader.
+
+Apple, Apple Wallet, HomeKit, iPhone and Apple Watch are trademarks of Apple
+Inc. This project is independent and is not affiliated with or endorsed by
+Apple Inc.

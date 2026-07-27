@@ -1,0 +1,22 @@
+[Unit]
+Description=TDS Door Access V2 controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tds-door-access
+Group=tds-door-access
+WorkingDirectory=/opt/tds-door-access
+Environment=PYTHONPATH=/opt/tds-door-access/backend
+ExecStart=/opt/tds-door-access/backend/.venv/bin/python /opt/tds-door-access/backend/run_controller.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/tds-door-access/backend/config
+
+[Install]
+WantedBy=multi-user.target
