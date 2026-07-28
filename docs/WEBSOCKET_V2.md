@@ -34,8 +34,10 @@ The MAC is an identifier, not proof of identity. Every controller installation
 therefore has one random fleet secret. Firmware derives a different credential
 for each reader as `HMAC-SHA256(fleet_secret, normalized_mac)`. This permits one
 firmware image for the entire fleet without sending the fleet secret over the
-network. The backend accepts only MAC addresses in its registry and never
-trusts a `door_id` supplied by firmware.
+network. The backend never trusts a `door_id` supplied by firmware. A new MAC
+that proves it has the fleet secret is automatically persisted and assigned
+to the controller's shared logical door. An explicitly disabled reader
+remains blocked.
 
 ## Configure firmware
 
@@ -73,6 +75,8 @@ The registry has one `fleet_token` and a MAC allowlist:
 ```json
 {
   "fleet_token": "LONG_RANDOM_FLEET_SECRET",
+  "auto_enroll": true,
+  "max_readers": 10,
   "readers": {
     "c8c9a33859af": {
       "door_id": "shared-door-controller",
@@ -82,7 +86,12 @@ The registry has one `fleet_token` and a MAC allowlist:
 }
 ```
 
-Add another reader without building different firmware:
+With `auto_enroll` enabled (the default), newly flashed readers are added and
+started on their first authenticated connection. The controller does not need
+to restart. Invalid fleet credentials are rejected, and `max_readers`
+defaults to 10.
+
+Manual registration remains available:
 
 ```bash
 cd /path/to/tds-door-access
@@ -90,7 +99,7 @@ PYTHONPATH=backend backend/.venv/bin/python \
   backend/manage_controller.py add-reader 84:f3:eb:12:34:56
 ```
 
-Restart the controller after changing the registry. `door_id` is the trusted
+Restart the controller after a manual registry edit. `door_id` is the trusted
 physical assignment; it is never accepted from the reader itself.
 
 An existing registry entry may temporarily retain its old `token` alongside
@@ -200,7 +209,10 @@ are treated as failed presentations. The backend keeps the PN532 online and
 immediately returns to polling instead of restarting the reader for five
 seconds. Transport `EIO`/timeout errors receive the same treatment. Three
 consecutive failures still trigger a PN532 reinitialization so a genuinely
-stuck reader can recover.
+stuck reader can recover. Firmware 3.3 reports that condition with
+`READER_STATUS` while leaving the WebSocket connected. The controller retries
+over the same socket with exponential backoff instead of producing reconnect
+and Python traceback storms.
 
 ## Protocol
 
@@ -227,6 +239,7 @@ Message types:
 | `BUTTON_EVENT` | Reader to controller | Debounced button press |
 | `BUTTON_RESULT` | Controller to reader | Button API feedback |
 | `FIRMWARE_UPDATE_CHECK` | Controller to reader | Trigger pull-update check |
+| `READER_STATUS` | Reader to controller | PN532 ready/recovering/failed state |
 | `RESPONSE` / `ERROR_RESPONSE` | Either | Correlated result |
 
 For each PN532 operation the backend sends `EXECUTE`. The NodeMCU writes the

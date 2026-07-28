@@ -1,0 +1,4 @@
+sudo systemctl restart tds-door-access
+sudo systemctl stop tds-door-access
+sudo systemctl start tds-door-access
+sudo journalctl -u tds-door-access --since today

@@ -1,5 +1,7 @@
 {
   "fleet_token": "REPLACE_WITH_THE_SAME_RANDOM_SECRET_AS_THE_FIRMWARE",
+  "auto_enroll": true,
+  "max_readers": 10,
   "readers": {
     "c8c9a33859af": {
       "door_id": "front-door",

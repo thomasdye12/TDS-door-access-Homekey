@@ -15,7 +15,13 @@ from typing import Any, Callable
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.server import ServerConnection, serve
 
-from .protocol import ErrorCode, Message, MessageType, normalize_reader_id
+from .protocol import (
+    ErrorCode,
+    Message,
+    MessageType,
+    ReaderRuntimeState,
+    normalize_reader_id,
+)
 
 
 log = logging.getLogger(__name__)
@@ -49,6 +55,21 @@ class ReaderRecord:
             else False
         )
         return current_matches or legacy_matches
+
+
+@dataclass
+class ReaderHealth:
+    connected: bool = False
+    state: str = "offline"
+    reason: str | None = "never_connected"
+    firmware: str | None = None
+    connected_at: int | None = None
+    last_seen: int | None = None
+    pn532_ready: bool = False
+    failure_count: int = 0
+    retry_in_seconds: float | None = None
+    wifi_rssi: int | None = None
+    wifi_reconnects: int | None = None
 
 
 def load_registry(path: Path) -> dict[str, ReaderRecord]:
@@ -91,10 +112,14 @@ class ReaderConnection:
         record: ReaderRecord,
         websocket: ServerConnection,
         firmware: str,
+        wifi_rssi: int | None = None,
+        wifi_reconnects: int | None = None,
     ) -> None:
         self.record = record
         self.websocket = websocket
         self.firmware = firmware
+        self.wifi_rssi = wifi_rssi
+        self.wifi_reconnects = wifi_reconnects
         self.connected_at = time.time()
         self._send_lock = threading.Lock()
         self._pending_lock = threading.Lock()
@@ -212,6 +237,13 @@ class ReaderConnection:
             except queue.Empty:
                 return
 
+    def dispatch_fault(self, error: BaseException) -> None:
+        self.clear_target_events()
+        try:
+            self._target_events.put_nowait(error)
+        except queue.Full:
+            pass
+
     def fail_pending(self, error: BaseException) -> None:
         with self._pending_lock:
             queues = list(self._pending.values())
@@ -232,6 +264,21 @@ class ReaderManager:
         self.registry = registry
         self._condition = threading.Condition()
         self._connections: dict[str, ReaderConnection] = {}
+        self._health = {
+            reader_id: ReaderHealth()
+            for reader_id in self.registry
+        }
+
+    def add_record(self, record: ReaderRecord) -> ReaderRecord:
+        """Add a newly authenticated reader without restarting the service."""
+        with self._condition:
+            existing = self.registry.get(record.reader_id)
+            if existing is not None:
+                return existing
+            self.registry[record.reader_id] = record
+            self._health[record.reader_id] = ReaderHealth()
+            self._condition.notify_all()
+            return record
 
     def get(self, reader_id: str) -> ReaderConnection | None:
         with self._condition:
@@ -258,6 +305,18 @@ class ReaderManager:
             if previous is not None:
                 previous.websocket.close(code=1012, reason="reader reconnected")
             self._connections[reader_id] = connection
+            now = int(time.time())
+            health = self._health[reader_id]
+            health.connected = True
+            health.state = "initializing"
+            health.reason = "pn532_initializing"
+            health.firmware = connection.firmware
+            health.wifi_rssi = connection.wifi_rssi
+            health.wifi_reconnects = connection.wifi_reconnects
+            health.connected_at = int(connection.connected_at)
+            health.last_seen = now
+            health.pn532_ready = False
+            health.retry_in_seconds = None
             self._condition.notify_all()
 
     def unregister(self, connection: ReaderConnection) -> None:
@@ -265,7 +324,92 @@ class ReaderManager:
         with self._condition:
             if self._connections.get(reader_id) is connection:
                 del self._connections[reader_id]
+                health = self._health[reader_id]
+                health.connected = False
+                health.state = "offline"
+                health.reason = "websocket_disconnected"
+                health.last_seen = int(time.time())
+                health.pn532_ready = False
+                health.retry_in_seconds = None
             self._condition.notify_all()
+
+    def mark_seen(self, reader_id: str) -> None:
+        reader_id = normalize_reader_id(reader_id)
+        with self._condition:
+            self._health[reader_id].last_seen = int(time.time())
+
+    def mark_ready(self, reader_id: str) -> None:
+        reader_id = normalize_reader_id(reader_id)
+        with self._condition:
+            health = self._health[reader_id]
+            health.connected = reader_id in self._connections
+            health.state = "online" if health.connected else "offline"
+            health.reason = None if health.connected else "websocket_disconnected"
+            health.pn532_ready = health.connected
+            health.failure_count = 0
+            health.retry_in_seconds = None
+            health.last_seen = int(time.time())
+
+    def mark_initializing(self, reader_id: str) -> None:
+        reader_id = normalize_reader_id(reader_id)
+        with self._condition:
+            health = self._health[reader_id]
+            health.connected = reader_id in self._connections
+            health.state = (
+                "initializing" if health.connected else "offline"
+            )
+            health.reason = (
+                "pn532_initializing"
+                if health.connected
+                else "websocket_disconnected"
+            )
+            health.pn532_ready = False
+            health.retry_in_seconds = None
+            health.last_seen = int(time.time())
+
+    def mark_fault(
+        self,
+        reader_id: str,
+        reason: str,
+        *,
+        failure_count: int = 0,
+        retry_in_seconds: float | None = None,
+    ) -> None:
+        reader_id = normalize_reader_id(reader_id)
+        with self._condition:
+            health = self._health[reader_id]
+            health.connected = reader_id in self._connections
+            health.state = "degraded" if health.connected else "offline"
+            health.reason = reason
+            health.pn532_ready = False
+            health.failure_count = failure_count
+            health.retry_in_seconds = retry_in_seconds
+            health.last_seen = int(time.time())
+
+    def reader_status(self) -> list[dict[str, Any]]:
+        with self._condition:
+            result = []
+            for reader_id, record in sorted(self.registry.items()):
+                health = self._health[reader_id]
+                result.append(
+                    {
+                        "reader_id": reader_id,
+                        "door_id": record.door_id,
+                        "enabled": record.enabled,
+                        "connected": health.connected,
+                        "state": health.state,
+                        "reason": health.reason,
+                        "pn532_ready": health.pn532_ready,
+                        "firmware": health.firmware,
+                        "connected_at": health.connected_at,
+                        "last_seen": health.last_seen,
+                        "failure_count": health.failure_count,
+                        "retry_in_seconds": health.retry_in_seconds,
+                        "wifi_rssi": health.wifi_rssi,
+                        "wifi_reconnects": health.wifi_reconnects,
+                    }
+                )
+            return result
 
 
 class ReaderWebSocketServer:
@@ -275,11 +419,15 @@ class ReaderWebSocketServer:
         host: str = "0.0.0.0",
         port: int = 8765,
         button_handler: Callable[[ReaderRecord], bool] | None = None,
+        enrollment_handler: (
+            Callable[[str, str], ReaderRecord | None] | None
+        ) = None,
     ) -> None:
         self.manager = manager
         self.host = host
         self.port = port
         self.button_handler = button_handler
+        self.enrollment_handler = enrollment_handler
         self._server: Any = None
         self._thread: threading.Thread | None = None
         self._event_executor = ThreadPoolExecutor(
@@ -316,27 +464,49 @@ class ReaderWebSocketServer:
 
     def _authenticate_hello(
         self, raw_hello: str | bytes
-    ) -> tuple[ReaderRecord, str]:
+    ) -> tuple[ReaderRecord, str, int | None, int | None]:
         if not isinstance(raw_hello, str):
             raise ValueError("first message must be a JSON hello")
         hello = json.loads(raw_hello)
         if hello.get("type") != "hello" or hello.get("protocol") != 1:
             raise ValueError("unsupported hello message")
         reader_id = normalize_reader_id(str(hello.get("reader_id", "")))
+        supplied_token = str(hello.get("token", ""))
         record = self.manager.registry.get(reader_id)
+        if record is None and self.enrollment_handler is not None:
+            record = self.enrollment_handler(reader_id, supplied_token)
         if record is None or not record.enabled:
             raise PermissionError(f"reader {reader_id} is not enabled")
-        supplied_token = str(hello.get("token", ""))
         if not record.accepts_token(supplied_token):
             raise PermissionError(f"reader {reader_id} supplied an invalid token")
-        return record, str(hello.get("firmware", "unknown"))
+        wifi_rssi = hello.get("wifi_rssi")
+        wifi_reconnects = hello.get("wifi_reconnects")
+        return (
+            record,
+            str(hello.get("firmware", "unknown")),
+            int(wifi_rssi) if wifi_rssi is not None else None,
+            int(wifi_reconnects)
+            if wifi_reconnects is not None
+            else None,
+        )
 
     def _handler(self, websocket: ServerConnection) -> None:
         connection: ReaderConnection | None = None
         try:
             raw_hello = websocket.recv(timeout=5)
-            record, firmware = self._authenticate_hello(raw_hello)
-            connection = ReaderConnection(record, websocket, firmware)
+            (
+                record,
+                firmware,
+                wifi_rssi,
+                wifi_reconnects,
+            ) = self._authenticate_hello(raw_hello)
+            connection = ReaderConnection(
+                record,
+                websocket,
+                firmware,
+                wifi_rssi=wifi_rssi,
+                wifi_reconnects=wifi_reconnects,
+            )
             self.manager.register(connection)
             log.info(
                 "Reader %s connected for door %s (firmware %s)",
@@ -348,6 +518,7 @@ class ReaderWebSocketServer:
                 if not isinstance(raw_message, bytes):
                     raise ValueError("reader response must be binary")
                 message = Message.decode(raw_message)
+                self.manager.mark_seen(record.reader_id)
                 if message.type == MessageType.BUTTON_EVENT:
                     if message.payload:
                         raise ValueError(
@@ -364,10 +535,58 @@ class ReaderWebSocketServer:
                             "target event payload must not be empty"
                         )
                     connection.dispatch_target(message.payload)
+                elif message.type == MessageType.READER_STATUS:
+                    if len(message.payload) != 3:
+                        raise ValueError(
+                            "reader status payload must contain 3 bytes"
+                        )
+                    state = ReaderRuntimeState(message.payload[0])
+                    failure_count = message.payload[2]
+                    if state == ReaderRuntimeState.READY:
+                        self.manager.mark_ready(record.reader_id)
+                    else:
+                        try:
+                            error_name = ErrorCode(
+                                message.payload[1]
+                            ).name.lower()
+                        except ValueError:
+                            error_name = (
+                                f"unknown_{message.payload[1]:02x}"
+                            )
+                        reason = (
+                            error_name
+                            if error_name.startswith("pn532_")
+                            else f"pn532_{error_name}"
+                        )
+                        self.manager.mark_fault(
+                            record.reader_id,
+                            reason,
+                            failure_count=failure_count,
+                        )
+                        connection.dispatch_fault(
+                            ReaderUnavailable(reason)
+                        )
                 else:
                     connection.dispatch(message)
-        except (ConnectionClosed, TimeoutError):
-            pass
+        except ConnectionClosed as error:
+            if connection is not None:
+                log.warning(
+                    "Reader %s WebSocket closed: %s",
+                    connection.record.reader_id,
+                    error,
+                )
+        except TimeoutError:
+            if connection is not None:
+                log.warning(
+                    "Reader %s WebSocket timed out",
+                    connection.record.reader_id,
+                )
+        except (PermissionError, ValueError) as error:
+            log.warning("Reader connection rejected: %s", error)
+            try:
+                websocket.close(code=1008, reason="invalid reader connection")
+            except ConnectionClosed:
+                pass
         except Exception:
             log.exception("Reader connection rejected or failed")
             try:
@@ -392,8 +611,8 @@ class ReaderWebSocketServer:
             self.host,
             self.port,
             compression=None,
-            ping_interval=10,
-            ping_timeout=5,
+            ping_interval=20,
+            ping_timeout=15,
             max_size=2048,
         )
         self._thread = threading.Thread(

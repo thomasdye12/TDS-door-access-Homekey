@@ -152,16 +152,13 @@ pio run -e websocket --target upload \
 
 Reconnect RX/TX and reset the board.
 
-### 3. Register the reader
+### 3. Connect the reader
 
-The reader ID is its Wi-Fi MAC without separators:
-
-```bash
-PYTHONPATH=backend backend/.venv/bin/python \
-  backend/manage_controller.py add-reader c8:c9:a3:38:59:af
-```
-
-Restart the controller after registry changes.
+Start the controller and power the newly flashed reader. On its first
+connection, a reader with the correct fleet secret is automatically persisted
+by MAC address, assigned to the shared logical door, and started immediately.
+No controller restart is required. Automatic enrollment defaults to a maximum
+of 10 readers and can be disabled in `readers.json`.
 
 ### 4. Start the controller
 
@@ -257,6 +254,12 @@ machine. PN532 acknowledgement and response waits no longer block the
 WebSocket callback, so heartbeats, button handling and OTA remain responsive
 while an iPhone uses long frame-waiting-time extensions.
 
+Firmware 3.3 keeps WebSocket connectivity independent from PN532 health.
+Readers report radio faults without disconnecting, controller retries use
+bounded exponential backoff, normal no-update firmware checks no longer
+interrupt the socket, and `/health` identifies degraded/offline readers and
+their latest failure reason.
+
 Build and publish a fixed approved image:
 
 ```bash
@@ -265,7 +268,7 @@ pio run -d firmware/esp8266-pn532-websocket -e websocket
 PYTHONPATH=backend backend/.venv/bin/python \
   backend/manage_controller.py publish-firmware \
   --binary firmware/esp8266-pn532-websocket/.pio/build/websocket/firmware.bin \
-  --version 3.2.0
+  --version 3.3.3
 ```
 
 Publishing calculates MD5/SHA-256, copies the image into the ignored runtime

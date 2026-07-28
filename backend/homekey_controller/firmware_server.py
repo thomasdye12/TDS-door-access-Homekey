@@ -145,28 +145,7 @@ class FirmwareHttpServer:
         )
 
     def _reader_status(self) -> list[dict]:
-        status = []
-        for reader_id, record in sorted(self.manager.registry.items()):
-            connection = self.manager.get(reader_id)
-            status.append(
-                {
-                    "reader_id": reader_id,
-                    "door_id": record.door_id,
-                    "enabled": record.enabled,
-                    "connected": connection is not None,
-                    "firmware": (
-                        connection.firmware
-                        if connection is not None
-                        else None
-                    ),
-                    "connected_at": (
-                        int(connection.connected_at)
-                        if connection is not None
-                        else None
-                    ),
-                }
-            )
-        return status
+        return self.manager.reader_status()
 
     def _notify_targets(self, targets: tuple[str, ...]) -> None:
         reader_ids = (
@@ -230,18 +209,44 @@ class FirmwareHttpServer:
                         release = None
                         firmware_status = "invalid"
                     readers = service._reader_status()
+                    enabled_readers = [
+                        item for item in readers if item["enabled"]
+                    ]
+                    all_readers_online = bool(enabled_readers) and all(
+                        item["state"] == "online"
+                        for item in enabled_readers
+                    )
+                    failed_readers = [
+                        {
+                            "reader_id": item["reader_id"],
+                            "door_id": item["door_id"],
+                            "state": item["state"],
+                            "reason": item["reason"],
+                        }
+                        for item in enabled_readers
+                        if item["state"] != "online"
+                    ]
                     self._json(
                         200,
                         {
-                            "status": "ok",
+                            "status": (
+                                "ok" if all_readers_online else "failure"
+                            ),
                             "controller_id": (
                                 service.controller_config.controller_id
                             ),
                             "door_id": service.controller_config.door_id,
+                            "all_readers_online": all_readers_online,
                             "connected_readers": sum(
                                 int(item["connected"]) for item in readers
                             ),
+                            "online_readers": sum(
+                                int(item["state"] == "online")
+                                for item in enabled_readers
+                            ),
                             "configured_readers": len(readers),
+                            "failed_readers": failed_readers,
+                            "readers": readers,
                             "firmware_version": (
                                 release.version
                                 if release is not None

@@ -21,6 +21,7 @@ enum class MessageType : uint8_t {
   BUTTON_RESULT = 0x21,
   FIRMWARE_UPDATE_CHECK = 0x22,
   TARGET_EVENT = 0x23,
+  READER_STATUS = 0x24,
   RESPONSE = 0x80,
   ERROR_RESPONSE = 0x7F,
 };
@@ -34,6 +35,12 @@ enum class ErrorCode : uint8_t {
   PN532_FRAME_TOO_LARGE = 6,
   PN532_BUSY = 7,
   PN532_BAD_FRAME = 8,
+};
+
+enum class ReaderRuntimeState : uint8_t {
+  READY = 0,
+  RECOVERING = 1,
+  FAILED = 2,
 };
 
 struct ProtocolMessage {

@@ -40,7 +40,14 @@ bool discoveryWaitForRemoval = false;
 uint8_t discoveryFrame[64];
 uint8_t discoveryFrameLength = 0;
 uint8_t consecutiveDiscoveryFailures = 0;
-uint32_t lastWifiAttemptAt = 0;
+uint32_t nextWifiAttemptAt = 0;
+uint32_t wifiConnectedAt = 0;
+uint32_t wifiReconnectDelayMs = WIFI_RETRY_INTERVAL_MS;
+uint32_t wifiDisconnectCount = 0;
+uint32_t websocketConnectedAt = 0;
+uint32_t websocketDisconnectedAt = 0;
+uint32_t lastWifiPathRecoveryAt = 0;
+uint32_t websocketReconnectDelayMs = WS_RECONNECT_INTERVAL_MS;
 uint32_t accessFeedbackUntil = 0;
 uint32_t buttonChangedAt = 0;
 uint32_t buttonRequestId = 0;
@@ -51,7 +58,10 @@ uint32_t nextDiscoveryAt = 0;
 uint32_t discoveryTargetPendingAt = 0;
 uint32_t discoveryNoTargetSince = 0;
 uint32_t nextTargetEventRequestId = 0x90000000;
+uint32_t nextReaderStatusRequestId = 0xA0000000;
 bool lastAccessGranted = false;
+bool wifiStarted = false;
+bool wifiWasConnected = false;
 String readerId;
 String readerToken;
 String deviceHostname;
@@ -88,6 +98,7 @@ uint16_t transceiveTimeoutMs = 0;
 uint32_t transceiveRequestId = 0;
 
 static void setStatusLed(bool on);
+static void setNetworkLed(bool on);
 
 static bool ringEmpty() {
   return ringHead == ringTail;
@@ -149,6 +160,10 @@ static void cancelAsyncTransceive() {
 
 static void hardwareResetPn532() {
   cancelAsyncTransceive();
+  autonomousDiscoveryEnabled = false;
+  discoveryTargetPending = false;
+  discoveryWaitForRemoval = false;
+  consecutiveDiscoveryFailures = 0;
   clearPn532Input();
   digitalWrite(PN532_RESET_PIN, LOW);
   delay(PN532_RESET_ASSERT_MS);
@@ -605,6 +620,18 @@ static void handleStartDiscovery(const ProtocolMessage& message) {
   sendProtocolMessage(
       MessageType::RESPONSE, message.requestId, 0, nullptr, 0
   );
+  const uint8_t status[] = {
+      static_cast<uint8_t>(ReaderRuntimeState::READY),
+      0,
+      0,
+  };
+  sendProtocolMessage(
+      MessageType::READER_STATUS,
+      nextReaderStatusRequestId++,
+      0,
+      status,
+      sizeof(status)
+  );
 }
 
 static void handleResumeDiscovery(const ProtocolMessage& message) {
@@ -980,7 +1007,7 @@ static void updateAsyncTransceive() {
   );
 }
 
-static void autonomousDiscoveryFailure() {
+static void autonomousDiscoveryFailure(ErrorCode error) {
   consecutiveDiscoveryFailures++;
   nextDiscoveryAt = millis() + 100;
   if (consecutiveDiscoveryFailures < DISCOVERY_FAILURE_LIMIT) {
@@ -989,10 +1016,20 @@ static void autonomousDiscoveryFailure() {
   autonomousDiscoveryEnabled = false;
   discoveryTargetPending = false;
   discoveryWaitForRemoval = false;
-  // Reconnecting makes the controller reinitialize the PN532 and configure
-  // autonomous discovery again. It also prevents a failed radio loop from
-  // silently remaining unavailable.
-  webSocket.disconnect();
+  // Keep network health independent from PN532 health. The controller will
+  // reinitialize the radio over this existing WebSocket with bounded backoff.
+  const uint8_t status[] = {
+      static_cast<uint8_t>(ReaderRuntimeState::FAILED),
+      static_cast<uint8_t>(error),
+      consecutiveDiscoveryFailures,
+  };
+  sendProtocolMessage(
+      MessageType::READER_STATUS,
+      nextReaderStatusRequestId++,
+      0,
+      status,
+      sizeof(status)
+  );
 }
 
 static void runAutonomousDiscovery() {
@@ -1046,7 +1083,7 @@ static void runAutonomousDiscovery() {
 
   if (!execute(0x32, RF_FIELD_OFF, sizeof(RF_FIELD_OFF), 300) ||
       !execute(0x4A, POLL_TYPE_A, sizeof(POLL_TYPE_A), 500)) {
-    autonomousDiscoveryFailure();
+    autonomousDiscoveryFailure(error);
     return;
   }
 
@@ -1058,7 +1095,7 @@ static void runAutonomousDiscovery() {
       return;
     }
     if (responseLength + 1 > MAX_PROTOCOL_PAYLOAD) {
-      autonomousDiscoveryFailure();
+      autonomousDiscoveryFailure(ErrorCode::PN532_FRAME_TOO_LARGE);
       return;
     }
     memmove(pn532AckFrame + 1, pn532AckFrame, responseLength);
@@ -1103,7 +1140,7 @@ static void runAutonomousDiscovery() {
           300
       ) ||
       !execute(0x32, RF_FIELD_OFF, sizeof(RF_FIELD_OFF), 300)) {
-    autonomousDiscoveryFailure();
+    autonomousDiscoveryFailure(error);
     return;
   }
   consecutiveDiscoveryFailures = 0;
@@ -1229,7 +1266,11 @@ static void sendHello() {
   hello += readerToken;
   hello += "\",\"firmware\":\"";
   hello += FIRMWARE_VERSION;
-  hello += "\"}";
+  hello += "\",\"wifi_rssi\":";
+  hello += String(WiFi.RSSI());
+  hello += ",\"wifi_reconnects\":";
+  hello += String(wifiDisconnectCount);
+  hello += "}";
   webSocket.sendTXT(hello);
 }
 
@@ -1237,12 +1278,29 @@ static void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED:
       websocketConnected = true;
+      websocketConnectedAt = millis();
+      websocketDisconnectedAt = 0;
       cancelAsyncTransceive();
       clearPn532Input();
       sendHello();
       break;
     case WStype_DISCONNECTED:
+      if (
+          !websocketConnected ||
+          millis() - websocketConnectedAt < WS_RECONNECT_STABLE_MS
+      ) {
+        websocketReconnectDelayMs = min<uint32_t>(
+            websocketReconnectDelayMs * 2,
+            WS_RECONNECT_MAX_INTERVAL_MS
+        );
+      } else {
+        websocketReconnectDelayMs = WS_RECONNECT_INTERVAL_MS;
+      }
+      webSocket.setReconnectInterval(websocketReconnectDelayMs);
       websocketConnected = false;
+      if (websocketDisconnectedAt == 0) {
+        websocketDisconnectedAt = millis();
+      }
       cancelAsyncTransceive();
       autonomousDiscoveryEnabled = false;
       discoveryTargetPending = false;
@@ -1264,16 +1322,73 @@ static void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 }
 
 static void connectWifiIfNeeded() {
+  const uint32_t now = millis();
   if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiWasConnected) {
+      wifiWasConnected = true;
+      wifiConnectedAt = now;
+    } else if (
+        wifiReconnectDelayMs != WIFI_RETRY_INTERVAL_MS &&
+        now - wifiConnectedAt >= WIFI_STABLE_RESET_MS
+    ) {
+      wifiReconnectDelayMs = WIFI_RETRY_INTERVAL_MS;
+    }
+    return;
+  }
+
+  if (wifiWasConnected) {
+    wifiWasConnected = false;
+    wifiDisconnectCount++;
+    nextWifiAttemptAt = 0;
+  }
+  if (
+      nextWifiAttemptAt != 0 &&
+      static_cast<int32_t>(now - nextWifiAttemptAt) < 0
+  ) {
+    return;
+  }
+
+  if (!wifiStarted) {
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    wifiStarted = true;
+  } else {
+    // Do not call WiFi.disconnect() here: repeatedly tearing down a slow
+    // association can keep a marginal reader offline indefinitely.
+    WiFi.reconnect();
+  }
+  nextWifiAttemptAt = now + wifiReconnectDelayMs;
+  wifiReconnectDelayMs = min<uint32_t>(
+      wifiReconnectDelayMs * 2,
+      WIFI_RETRY_MAX_INTERVAL_MS
+  );
+}
+
+static void recoverStaleWifiPathIfNeeded() {
+  if (
+      WiFi.status() != WL_CONNECTED ||
+      websocketConnected ||
+      websocketDisconnectedAt == 0 ||
+      millis() - websocketDisconnectedAt < WS_WIFI_RECOVERY_MS
+  ) {
     return;
   }
   const uint32_t now = millis();
-  if (lastWifiAttemptAt != 0 &&
-      now - lastWifiAttemptAt < WIFI_RETRY_INTERVAL_MS) {
+  if (
+      lastWifiPathRecoveryAt != 0 &&
+      now - lastWifiPathRecoveryAt < WS_WIFI_RECOVERY_MS
+  ) {
     return;
   }
-  lastWifiAttemptAt = now;
-  WiFi.disconnect();
+
+  // Some APs retain an ESP8266 association after its IP data path has become
+  // unusable. A single deliberate re-association after a full minute offline
+  // forces a new scan/BSSID choice without repeatedly aborting association.
+  lastWifiPathRecoveryAt = now;
+  wifiDisconnectCount++;
+  wifiWasConnected = false;
+  wifiReconnectDelayMs = WIFI_RETRY_INTERVAL_MS;
+  nextWifiAttemptAt = now + WIFI_RETRY_INTERVAL_MS;
+  WiFi.disconnect(false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
@@ -1332,13 +1447,8 @@ static void checkForFirmwareUpdate() {
   firmwareFirstCheckCompleted = true;
   lastFirmwareCheckAt = millis();
 
-  // Stop the controller from starting another PN532 operation while the
-  // firmware request is in progress. A 304 reconnects normally; a 200 enters
-  // the updater and reboots only after the image has been verified.
-  websocketConnected = false;
-  webSocket.disconnect();
-  yield();
-
+  // A normal 304 check must not interrupt reader service. The updater's
+  // onStart callback disconnects only when a real image will be installed.
   WiFiClient client;
   const HTTPUpdateResult result = ESPhttpUpdate.update(
       client,
@@ -1413,6 +1523,39 @@ static void setStatusLed(bool on) {
   digitalWrite(STATUS_LED_PIN, on ? HIGH : LOW);
 }
 
+static void setNetworkLed(bool on) {
+  // The NodeMCU built-in LED is active low.
+  digitalWrite(NETWORK_LED_PIN, on ? LOW : HIGH);
+}
+
+static void updateNetworkLed() {
+  const uint32_t now = millis();
+  if (otaInProgress) {
+    // Very rapid blink while flash is being written.
+    setNetworkLed((now / 80) % 2);
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    // Fast blink: associating with Wi-Fi.
+    setNetworkLed((now / 200) % 2);
+    return;
+  }
+  if (!websocketConnected) {
+    // Slow blink: Wi-Fi is up, controller connection is not.
+    setNetworkLed((now / 600) % 2);
+    return;
+  }
+  if (!autonomousDiscoveryEnabled) {
+    // Double pulse: controller is connected but PN532 is initializing or
+    // waiting for its bounded recovery cycle.
+    const uint32_t phase = now % 2000;
+    setNetworkLed(phase < 120 || (phase >= 240 && phase < 360));
+    return;
+  }
+  // Solid: Wi-Fi, controller WebSocket, and PN532 discovery are ready.
+  setNetworkLed(true);
+}
+
 static void updateStatusLed() {
   if (otaInProgress) {
     setStatusLed((millis() / 50) % 2);
@@ -1439,6 +1582,11 @@ static void updateStatusLed() {
 }
 
 void setup() {
+  // GPIO2/D4 is a boot strap pin. Keep it high while changing it to output;
+  // the on-board LED is therefore off until firmware is fully running.
+  digitalWrite(NETWORK_LED_PIN, HIGH);
+  pinMode(NETWORK_LED_PIN, OUTPUT);
+  setNetworkLed(false);
   pinMode(STATUS_LED_PIN, OUTPUT);
   setStatusLed(false);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
@@ -1484,15 +1632,26 @@ void loop() {
   }
   if (otaInProgress) {
     updateStatusLed();
+    updateNetworkLed();
     yield();
     return;
   }
   webSocket.loop();
+  recoverStaleWifiPathIfNeeded();
+  if (
+      websocketConnected &&
+      websocketReconnectDelayMs != WS_RECONNECT_INTERVAL_MS &&
+      millis() - websocketConnectedAt >= WS_RECONNECT_STABLE_MS
+  ) {
+    websocketReconnectDelayMs = WS_RECONNECT_INTERVAL_MS;
+    webSocket.setReconnectInterval(websocketReconnectDelayMs);
+  }
   updateButton();
   drainPn532Uart();
   updateAsyncTransceive();
   runAutonomousDiscovery();
   updateStatusLed();
+  updateNetworkLed();
   checkFirmwareUpdateIfDue();
 
 #if SERIAL_DIAGNOSTICS

@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import unittest
 
-from homekey_bridge.protocol import Message, MessageType, normalize_reader_id
+from homekey_bridge.protocol import (
+    ErrorCode,
+    Message,
+    MessageType,
+    ReaderRuntimeState,
+    normalize_reader_id,
+)
 
 
 class ProtocolTests(unittest.TestCase):
@@ -83,6 +89,20 @@ class ProtocolTests(unittest.TestCase):
         message = Message(
             type=MessageType.FIRMWARE_UPDATE_CHECK,
             request_id=77,
+        )
+        self.assertEqual(Message.decode(message.encode()), message)
+
+    def test_reader_status_round_trip(self) -> None:
+        message = Message(
+            type=MessageType.READER_STATUS,
+            request_id=0xA0000000,
+            payload=bytes(
+                [
+                    ReaderRuntimeState.FAILED,
+                    ErrorCode.PN532_TIMEOUT,
+                    3,
+                ]
+            ),
         )
         self.assertEqual(Message.decode(message.encode()), message)
 

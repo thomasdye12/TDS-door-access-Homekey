@@ -4,7 +4,8 @@ import threading
 import unittest
 from types import SimpleNamespace
 
-from homekey_bridge.protocol import MessageType
+from homekey_bridge.protocol import ErrorCode, MessageType
+from homekey_bridge.server import ReaderCommandError
 from homekey_controller.access_api import AccessDecision
 from homekey_controller.readers import CredentialResult, ReaderWorker
 from homekey_controller.store import AccessEvent
@@ -64,6 +65,12 @@ class FakeStore:
 
 
 class ReaderDecisionTests(unittest.TestCase):
+    def test_pn532_failure_reason_is_not_double_prefixed(self) -> None:
+        reason = ReaderWorker._failure_reason(
+            ReaderCommandError(ErrorCode.PN532_TIMEOUT)
+        )
+        self.assertEqual(reason, "pn532_timeout")
+
     def test_decodes_local_type_a_discovery(self) -> None:
         # status, NbTg, Tg, SENS_RES, SEL_RES, UID length, UID
         payload = bytes.fromhex("0101014400200404A1B2C3")

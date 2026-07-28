@@ -35,24 +35,67 @@ Expected:
   "status": "ok",
   "controller_id": "homekey-main",
   "door_id": "shared-door-controller",
+  "all_readers_online": true,
   "connected_readers": 1,
+  "online_readers": 1,
   "configured_readers": 1,
-  "firmware_version": "2.5.0",
+  "failed_readers": [],
+  "readers": [
+    {
+      "reader_id": "c8c9a33859af",
+      "door_id": "front-door",
+      "state": "online",
+      "reason": null,
+      "connected": true,
+      "pn532_ready": true,
+      "firmware": "3.3.1",
+      "wifi_rssi": -61,
+      "wifi_reconnects": 0
+    }
+  ],
+  "firmware_version": "3.3.1",
   "firmware_status": "ready"
 }
 ```
 
+`status` becomes `failure` when any enabled reader is offline, initializing or
+degraded. `failed_readers` identifies each affected reader and its latest
+reason. A PN532 fault does not imply a WebSocket failure: a degraded reader can
+remain connected while radio reinitialization backs off from 2 to 60 seconds.
+Firmware 3.3.1 and later also report connection-time `wifi_rssi` and the
+number of Wi-Fi drops since boot as `wifi_reconnects`. Rough guidance is:
+`-30` to `-67 dBm` is strong, `-68` to `-75 dBm` is usually workable, and
+values below approximately `-80 dBm` are likely to be unstable.
+
+### Built-in network LED
+
+Firmware 3.3.2 uses the NodeMCU's built-in active-low LED for live state:
+
+| Pattern | State |
+|---|---|
+| Fast blink | Connecting or reconnecting to Wi-Fi |
+| Slow blink | Wi-Fi connected; controller WebSocket disconnected |
+| Double pulse | Controller connected; PN532 initializing or recovering |
+| Solid on | Wi-Fi, controller and PN532 are ready |
+| Very rapid blink | Firmware update is being written |
+
+The external D1 LED remains dedicated to access and button feedback.
+
+Firmware 3.3.3 tolerates marginal links for longer before declaring the
+WebSocket dead and caps reconnect backoff at 15 seconds. If Wi-Fi still claims
+to be associated but the controller has been unreachable for 60 seconds, the
+reader deliberately re-associates so it can rescan the available APs. That
+recovery is included in `wifi_reconnects`.
+
 ## Reader provisioning
 
-1. Obtain the NodeMCU station MAC.
-2. Add it to the registry.
-3. Restart the controller.
-4. Flash the common fleet firmware.
+1. Flash the common fleet firmware.
+2. Power the reader within reach of the controller network.
+3. Confirm automatic enrollment in `/api/readers`.
 
-```bash
-PYTHONPATH=backend backend/.venv/bin/python \
-  backend/manage_controller.py add-reader 84:f3:eb:12:34:56
-```
+The default registry policy automatically enrolls up to 10 readers that prove
+knowledge of the fleet secret. Manual registration remains available through
+`backend/manage_controller.py add-reader`.
 
 Reader hostname:
 

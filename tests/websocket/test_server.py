@@ -11,10 +11,16 @@ from pathlib import Path
 
 from websockets.sync.client import connect
 
-from homekey_bridge.protocol import Message, MessageType
+from homekey_bridge.protocol import (
+    ErrorCode,
+    Message,
+    MessageType,
+    ReaderRuntimeState,
+)
 from homekey_bridge.server import (
     ReaderManager,
     ReaderRecord,
+    ReaderUnavailable,
     ReaderWebSocketServer,
     load_registry,
 )
@@ -33,6 +39,70 @@ def unused_port() -> int:
 
 
 class ServerTests(unittest.TestCase):
+    def test_unknown_reader_can_be_enrolled_during_hello(self) -> None:
+        manager = ReaderManager({})
+        enrollment_calls = []
+
+        def enroll(reader_id: str, supplied_token: str):
+            enrollment_calls.append((reader_id, supplied_token))
+            if supplied_token != TOKEN:
+                return None
+            return manager.add_record(
+                ReaderRecord(
+                    reader_id,
+                    "shared-door-controller",
+                    TOKEN,
+                    True,
+                )
+            )
+
+        server = ReaderWebSocketServer(
+            manager,
+            enrollment_handler=enroll,
+        )
+        record, firmware, wifi_rssi, wifi_reconnects = (
+            server._authenticate_hello(
+                json.dumps(
+                    {
+                        "type": "hello",
+                        "protocol": 1,
+                        "reader_id": "C8:C9:A3:38:59:AF",
+                        "token": TOKEN,
+                        "firmware": "3.3.0",
+                        "wifi_rssi": -67,
+                        "wifi_reconnects": 4,
+                    }
+                )
+            )
+        )
+
+        self.assertEqual(record.reader_id, READER_ID)
+        self.assertEqual(record.door_id, "shared-door-controller")
+        self.assertEqual(firmware, "3.3.0")
+        self.assertEqual(wifi_rssi, -67)
+        self.assertEqual(wifi_reconnects, 4)
+        self.assertEqual(enrollment_calls, [(READER_ID, TOKEN)])
+
+    def test_unknown_reader_with_invalid_token_is_rejected(self) -> None:
+        manager = ReaderManager({})
+        server = ReaderWebSocketServer(
+            manager,
+            enrollment_handler=lambda _reader_id, _token: None,
+        )
+
+        with self.assertRaisesRegex(PermissionError, "is not enabled"):
+            server._authenticate_hello(
+                json.dumps(
+                    {
+                        "type": "hello",
+                        "protocol": 1,
+                        "reader_id": READER_ID,
+                        "token": "invalid",
+                        "firmware": "3.3.0",
+                    }
+                )
+            )
+
     def test_registry_derives_reader_token_from_fleet_secret(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "readers.json"
@@ -221,6 +291,69 @@ class ServerTests(unittest.TestCase):
                     connection.wait_for_target(timeout=2),
                     target,
                 )
+        finally:
+            server.stop()
+
+    def test_reader_fault_updates_health_without_disconnecting(self) -> None:
+        record = ReaderRecord(READER_ID, "front-door", TOKEN, True)
+        manager = ReaderManager({READER_ID: record})
+        port = unused_port()
+        server = ReaderWebSocketServer(manager, "127.0.0.1", port)
+        server.start()
+        try:
+            with connect(
+                f"ws://127.0.0.1:{port}/readers"
+            ) as websocket:
+                websocket.send(
+                    json.dumps(
+                        {
+                            "type": "hello",
+                            "protocol": 1,
+                            "reader_id": READER_ID,
+                            "token": TOKEN,
+                            "firmware": "3.3.0",
+                        }
+                    )
+                )
+                connection = manager.wait_for(READER_ID, timeout=2)
+                websocket.send(
+                    Message(
+                        MessageType.READER_STATUS,
+                        request_id=0xA0000000,
+                        payload=bytes(
+                            [
+                                ReaderRuntimeState.FAILED,
+                                ErrorCode.PN532_TIMEOUT,
+                                3,
+                            ]
+                        ),
+                    ).encode()
+                )
+                with self.assertRaisesRegex(
+                    ReaderUnavailable, "pn532_timeout"
+                ):
+                    connection.wait_for_target(timeout=2)
+                status = manager.reader_status()[0]
+                self.assertTrue(status["connected"])
+                self.assertEqual(status["state"], "degraded")
+                self.assertEqual(status["reason"], "pn532_timeout")
+
+                websocket.send(
+                    Message(
+                        MessageType.READER_STATUS,
+                        request_id=0xA0000001,
+                        payload=bytes(
+                            [ReaderRuntimeState.READY, 0, 0]
+                        ),
+                    ).encode()
+                )
+                for _ in range(20):
+                    status = manager.reader_status()[0]
+                    if status["state"] == "online":
+                        break
+                    threading.Event().wait(0.01)
+                self.assertEqual(status["state"], "online")
+                self.assertTrue(status["pn532_ready"])
         finally:
             server.stop()
 

@@ -24,6 +24,7 @@ class MessageType(enum.IntEnum):
     BUTTON_RESULT = 0x21
     FIRMWARE_UPDATE_CHECK = 0x22
     TARGET_EVENT = 0x23
+    READER_STATUS = 0x24
     RESPONSE = 0x80
     ERROR_RESPONSE = 0x7F
 
@@ -37,6 +38,12 @@ class ErrorCode(enum.IntEnum):
     PN532_FRAME_TOO_LARGE = 6
     PN532_BUSY = 7
     PN532_BAD_FRAME = 8
+
+
+class ReaderRuntimeState(enum.IntEnum):
+    READY = 0
+    RECOVERING = 1
+    FAILED = 2
 
 
 @dataclasses.dataclass(frozen=True)

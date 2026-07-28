@@ -109,6 +109,10 @@ class CredentialResult:
     transaction_ms: float
 
 
+class ReaderHardwareFault(RuntimeError):
+    """Expected PN532 failure that requires bounded reinitialization."""
+
+
 class ReaderWorker:
     def __init__(
         self,
@@ -138,6 +142,8 @@ class ReaderWorker:
         )
         self._consecutive_failures = 0
         self._autonomous_discovery = False
+        self._recovery_attempts = 0
+        self._ready_since: float | None = None
 
     def start(self) -> None:
         self.thread.start()
@@ -441,8 +447,16 @@ class ReaderWorker:
             errno.ETIMEDOUT,
         )
 
+    @staticmethod
+    def _failure_reason(error: BaseException) -> str:
+        if isinstance(error, ReaderCommandError):
+            name = error.code.name.lower()
+            return name if name.startswith("pn532_") else f"pn532_{name}"
+        return str(error)
+
     def _reader_session(self) -> None:
         self.manager.wait_for(self.reader_id, timeout=None)
+        self.manager.mark_initializing(self.reader_id)
         self.clf.device = None
         self.clf.open(self.clf.path)
         if self.clf.device is None:
@@ -451,6 +465,8 @@ class ReaderWorker:
             )
         log.info("Reader %s PN532 ready", self.reader_id)
         self._autonomous_discovery = self._start_autonomous_discovery()
+        self.manager.mark_ready(self.reader_id)
+        self._ready_since = time.monotonic()
         if self._autonomous_discovery:
             log.info(
                 "Reader %s autonomous discovery active",
@@ -465,7 +481,7 @@ class ReaderWorker:
                     raise
                 self._consecutive_failures += 1
                 if self._consecutive_failures >= 3:
-                    raise
+                    raise ReaderHardwareFault(str(error)) from None
                 log.warning(
                     "Reader %s transient NFC failure (%d/3): %s",
                     self.reader_id,
@@ -481,6 +497,7 @@ class ReaderWorker:
 
     def _run(self) -> None:
         while not self.stop_event.is_set():
+            retry_delay = 2.0
             try:
                 if not self.store.is_configured():
                     log.info(
@@ -490,8 +507,35 @@ class ReaderWorker:
                     self.stop_event.wait(2)
                     continue
                 self._reader_session()
-            except ReaderUnavailable as error:
-                log.warning("Reader %s offline: %s", self.reader_id, error)
+            except (
+                ReaderUnavailable,
+                ReaderCommandError,
+                ReaderHardwareFault,
+            ) as error:
+                now = time.monotonic()
+                if (
+                    self._ready_since is not None
+                    and now - self._ready_since >= 60
+                ):
+                    self._recovery_attempts = 0
+                self._recovery_attempts += 1
+                retry_delay = min(
+                    float(2 ** min(self._recovery_attempts, 6)),
+                    60.0,
+                )
+                reason = self._failure_reason(error)
+                self.manager.mark_fault(
+                    self.reader_id,
+                    reason,
+                    failure_count=self._recovery_attempts,
+                    retry_in_seconds=retry_delay,
+                )
+                log.warning(
+                    "Reader %s unavailable: %s; retrying in %.0f seconds",
+                    self.reader_id,
+                    reason,
+                    retry_delay,
+                )
             except Exception:
                 log.exception(
                     "Reader %s failed; reinitializing in 2 seconds",
@@ -502,4 +546,4 @@ class ReaderWorker:
                     self.clf.close()
                 except Exception:
                     pass
-            self.stop_event.wait(2)
+            self.stop_event.wait(retry_delay)

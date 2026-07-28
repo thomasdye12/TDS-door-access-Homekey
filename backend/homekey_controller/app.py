@@ -5,12 +5,12 @@ import signal
 import threading
 import time
 import uuid
-from pathlib import Path
 
 from pyhap.accessory_driver import AccessoryDriver
 
 from homekey_bridge.server import (
     ReaderManager,
+    ReaderRecord,
     ReaderWebSocketServer,
     load_registry,
 )
@@ -20,6 +20,7 @@ from .button_api import ButtonApiClient
 from .config import ControllerConfig
 from .firmware_server import FirmwareHttpServer
 from .readers import ReaderWorker, install_websocket_nfc_transport
+from .reader_enrollment import enroll_fleet_reader
 from .registration import EnrollmentService, RegistrationAccessory
 from .store import SQLiteKeyStore
 
@@ -30,6 +31,9 @@ log = logging.getLogger(__name__)
 class HomeKeyController:
     def __init__(self, config: ControllerConfig) -> None:
         self.config = config
+        self.stop_event = threading.Event()
+        self._enrollment_lock = threading.Lock()
+        self._workers_lock = threading.Lock()
         self.store = SQLiteKeyStore(
             config.database.path,
             config.database.encryption_key_file,
@@ -37,11 +41,14 @@ class HomeKeyController:
         registry = load_registry(config.reader_registry)
         self.manager = ReaderManager(registry)
         self.button_api = ButtonApiClient(config.button_api)
+        self.access_api = AccessApiClient(config.access_api)
+        self.authentication_lock = threading.Lock()
         self.websocket_server = ReaderWebSocketServer(
             self.manager,
             config.websocket_host,
             config.websocket_port,
             button_handler=self._handle_button,
+            enrollment_handler=self._auto_enroll_reader,
         )
         self.firmware_server = FirmwareHttpServer(
             config.firmware_server,
@@ -49,24 +56,57 @@ class HomeKeyController:
             self.manager,
         )
         install_websocket_nfc_transport(self.manager)
-        access_api = AccessApiClient(config.access_api)
-        authentication_lock = threading.Lock()
         self.workers = [
-            ReaderWorker(
-                reader_id=record.reader_id,
-                manager=self.manager,
-                store=self.store,
-                access_api=access_api,
-                config=config,
-                authentication_lock=authentication_lock,
-            )
+            self._new_worker(record.reader_id)
             for record in registry.values()
             if record.enabled
         ]
         self.hap_driver: AccessoryDriver | None = None
         if config.homekit.enabled:
             self.hap_driver = self._build_hap_driver()
-        self.stop_event = threading.Event()
+
+    def _new_worker(self, reader_id: str) -> ReaderWorker:
+        return ReaderWorker(
+            reader_id=reader_id,
+            manager=self.manager,
+            store=self.store,
+            access_api=self.access_api,
+            config=self.config,
+            authentication_lock=self.authentication_lock,
+        )
+
+    def _auto_enroll_reader(
+        self,
+        reader_id: str,
+        supplied_token: str,
+    ) -> ReaderRecord | None:
+        """Persist and start a fleet-authenticated reader on first contact."""
+        with self._enrollment_lock:
+            if self.stop_event.is_set():
+                return None
+            existing = self.manager.registry.get(reader_id)
+            if existing is not None:
+                return existing
+
+            record = enroll_fleet_reader(
+                self.config.reader_registry,
+                self.config.door_id,
+                reader_id,
+                supplied_token,
+            )
+            if record is None:
+                return None
+            record = self.manager.add_record(record)
+            worker = self._new_worker(reader_id)
+            with self._workers_lock:
+                self.workers.append(worker)
+                worker.start()
+            log.info(
+                "Auto-enrolled reader %s for logical door %s",
+                reader_id,
+                self.config.door_id,
+            )
+            return record
 
     def _handle_button(self, reader) -> bool:
         event_id = str(uuid.uuid4())
@@ -106,10 +146,15 @@ class HomeKeyController:
         return driver
 
     def start(self) -> None:
+        # Existing workers wait for their reader connection, so start them
+        # before accepting WebSockets. This also prevents an auto-enrolled
+        # worker from racing the initial worker-start loop.
+        with self._workers_lock:
+            workers = list(self.workers)
+        for worker in workers:
+            worker.start()
         self.websocket_server.start()
         self.firmware_server.start()
-        for worker in self.workers:
-            worker.start()
         log.info(
             "Controller %s started for logical door %s with %d readers",
             self.config.controller_id,
@@ -140,11 +185,16 @@ class HomeKeyController:
             return
         self.stop_event.set()
         log.info("Stopping Home Key controller")
-        for worker in self.workers:
+        # Wait for any in-flight enrollment to finish before taking the final
+        # worker snapshot. New enrollment attempts see stop_event and reject.
+        with self._enrollment_lock:
+            with self._workers_lock:
+                workers = list(self.workers)
+        for worker in workers:
             worker.stop()
         self.firmware_server.stop()
         self.websocket_server.stop()
         if self.hap_driver is not None:
             self.hap_driver.stop()
-        for worker in self.workers:
+        for worker in workers:
             worker.join(timeout=3)

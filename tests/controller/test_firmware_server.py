@@ -90,7 +90,22 @@ class FirmwareServerTests(unittest.TestCase):
             f"http://127.0.0.1:{self.port}/health"
         ) as response:
             health = json.load(response)
-        self.assertEqual(health["status"], "ok")
+        self.assertEqual(health["status"], "failure")
+        self.assertFalse(health["all_readers_online"])
+        self.assertEqual(health["connected_readers"], 0)
+        self.assertEqual(health["online_readers"], 0)
+        self.assertEqual(
+            health["failed_readers"],
+            [
+                {
+                    "reader_id": READER_ID,
+                    "door_id": "front-door",
+                    "state": "offline",
+                    "reason": "never_connected",
+                }
+            ],
+        )
+        self.assertEqual(health["readers"][0]["state"], "offline")
         self.assertEqual(health["firmware_version"], "2.4.0")
 
         request = urllib.request.Request(

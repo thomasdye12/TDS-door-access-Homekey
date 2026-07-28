@@ -99,7 +99,14 @@ def wait_for_controller(base_url: str, deadline: float) -> None:
     while time.monotonic() < deadline:
         try:
             health = request_json(f"{base_url}/health")
-            if isinstance(health, dict) and health.get("status") == "ok":
+            # A reachable controller may intentionally report "failure"
+            # while one physical reader is degraded. That must not prevent
+            # deploying firmware which may itself repair the reader.
+            if (
+                isinstance(health, dict)
+                and health.get("status") in {"ok", "failure"}
+                and health.get("controller_id")
+            ):
                 return
         except (HTTPError, URLError, TimeoutError, ValueError):
             pass
